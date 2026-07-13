@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Prose check (no em/en dashes in markdown)
+        run: bash scripts/check-prose.sh
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit + integration tests
+        run: cargo test --all-targets
+
+      - name: End-to-end (local TLS upstream)
+        run: |
+          cargo build --release
+          bash scripts/e2e.sh
+
+  # Every changed line of src/ must be exercised by the test suite: a diff
+  # that adds logic without a covering test fails here, whatever its author
+  # (human or agent) claims. Needs the PR base, so pull_request only.
+  diff-coverage:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Diff coverage gate
+        run: bash scripts/diff-cover.sh "origin/${{ github.base_ref }}"
+
+  # Brief fuzz pass over the byte-parsing surfaces (swap, DLP, usage parsing,
+  # request-head/cache repair), seeded from fuzz/seeds/. Catches invariant
+  # violations and panics, not deep bugs — long campaigns run locally.
+  fuzz-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Fuzz smoke (60s per target)
+        run: bash scripts/fuzz-smoke.sh 60

@@ -1,0 +1,52 @@
+[package]
+name = "decoyrail"
+version = "0.2.9"
+edition = "2021"
+description = "Endpoint firewall for AI agents: decoy secrets, egress policy, audit"
+repository = "https://github.com/decoyrail-team/decoyrail"
+license-file = "LICENSE"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "http2"] }
+chacha20poly1305 = "0.10"
+# License signature verification (Ed25519). Already in the tree via rustls;
+# the binary only verifies — signing lives in the private issuing tool.
+ring = "0.17"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Comment-preserving edits to policy.toml (`decoyrail dlp set`); already in the
+# tree as toml's own backend.
+toml_edit = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+bytes = "1"
+futures-util = "0.3"
+fs2 = "0.4"
+time = { version = "0.3", features = ["std"] }
+zeroize = { version = "1", features = ["alloc"] }
+rpassword = "7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
