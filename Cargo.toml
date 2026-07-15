@@ -1,6 +1,6 @@
 [package]
 name = "decoyrail"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 description = "Endpoint firewall for AI agents: decoy secrets, egress policy, audit"
 repository = "https://github.com/decoyrail-team/decoyrail"
@@ -46,6 +46,11 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+# cargo llvm-cov passes --cfg coverage; vault.rs swaps the keychain dispatcher
+# for its file arm there so untestable OS wiring stays out of the diff gate.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [profile.release]
 lto = true

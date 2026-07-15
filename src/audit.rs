@@ -367,7 +367,7 @@ pub(crate) fn seal_for_test(prev_hash: &str, ev: &mut AuditEvent) {
     ev.hash = chain_hash(prev_hash, ev, PayloadVersion::Analytics).unwrap();
 }
 
-/// Releases an exclusive file lock on drop.
+/// Releases a file lock on drop.
 struct LockGuard<'a>(&'a std::fs::File);
 
 impl Drop for LockGuard<'_> {
@@ -420,10 +420,16 @@ pub fn verify() -> Result<u64> {
             return Ok(0);
         }
     };
+    // Read under a shared lock. An append holds the exclusive lock across
+    // both the log line and the head anchor; verifying without a lock can
+    // catch the pair half-done (anchor already advanced, line not yet read)
+    // and report truncation on a healthy log.
+    fs2::FileExt::lock_shared(&file).context("locking audit log for verify")?;
+    let _guard = LockGuard(&file);
     let mut prev = ZERO_HASH.to_string();
     let mut count = 0u64;
     let mut last: Option<(u64, String)> = None;
-    for line in std::io::BufReader::new(file).lines() {
+    for line in std::io::BufReader::new(&file).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -546,6 +552,47 @@ mod tests {
 
         // A single unbroken, correctly-sequenced chain of 4 events.
         assert_eq!(verify().unwrap(), 4);
+    }
+
+    #[test]
+    fn verify_never_false_alarms_during_appends() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        let mut a = Auditor::open().unwrap();
+        a.append(
+            Entry {
+                host: "seed".into(),
+                action: "allow".into(),
+                ..Default::default()
+            },
+            "t0".into(),
+        )
+        .unwrap();
+
+        // A live proxy keeps appending while `decoyrail log --verify` reads.
+        // The shared lock in `verify` makes each read see whole appends only;
+        // without it, an anchor written just after the log was read presents
+        // as truncation of a healthy log.
+        let writer = std::thread::spawn(move || {
+            for i in 1..=200 {
+                a.append(
+                    Entry {
+                        host: format!("h{i}"),
+                        action: "allow".into(),
+                        ..Default::default()
+                    },
+                    format!("t{i}"),
+                )
+                .unwrap();
+            }
+        });
+        while !writer.is_finished() {
+            verify().expect("verify raced a concurrent append");
+        }
+        writer.join().unwrap();
+        assert_eq!(verify().unwrap(), 201);
     }
 
     #[test]
