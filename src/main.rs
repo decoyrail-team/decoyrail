@@ -1427,7 +1427,9 @@ fn key_status() -> Result<()> {
                 );
             } else {
                 println!(
-                    "Keychain item ({}): absent (opt in with `decoyrail key migrate --to keychain`)",
+                    "Keychain item ({}): absent, using the vault.key file \
+                     (release installs start on the keychain; move an \
+                     existing key in with `decoyrail key migrate --to keychain`)",
                     decoyrail::keyring::SERVICE
                 );
             }

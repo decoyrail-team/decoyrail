@@ -213,10 +213,13 @@ fn alnum(seed_hex: &str, n: usize) -> String {
 /// Which store holds the vault key for this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyBackend {
-    /// Raw 32-byte `vault.key` in the home dir (the default everywhere).
+    /// Raw 32-byte `vault.key` in the home dir: every non-default home,
+    /// every dev build, and installs that migrated back with
+    /// `decoyrail key migrate --to file`.
     File,
-    /// macOS login-keychain item bound to the default home (opt-in via
-    /// `decoyrail key migrate --to keychain`).
+    /// macOS login-keychain item bound to the default home. A release
+    /// build's first run against the default home starts here; existing
+    /// file-backed installs opt in via `decoyrail key migrate --to keychain`.
     Keychain,
 }
 
@@ -243,15 +246,88 @@ pub fn resolve_backend() -> Result<KeyBackend> {
     Ok(KeyBackend::File)
 }
 
+/// Whether a brand-new install mints its key in the keychain instead of the
+/// file: macOS, default home, release build, and no file key yet. Dev builds
+/// stay on the file because an unsigned binary re-prompts after every
+/// rebuild; non-default homes never touch the keychain (home binding).
+fn keychain_is_first_run_default(
+    default_home: bool,
+    release_build: bool,
+    file_key_exists: bool,
+) -> bool {
+    cfg!(target_os = "macos") && default_home && release_build && !file_key_exists
+}
+
+#[cfg_attr(coverage, allow(dead_code))]
+fn first_run_keychain_default() -> Result<bool> {
+    Ok(keychain_is_first_run_default(
+        config::is_default_home(),
+        !cfg!(debug_assertions),
+        config::vault_key_path()?.exists(),
+    ))
+}
+
+/// Mint the first key of a fresh install directly into `store`. This runs
+/// only when no key exists anywhere yet, so unlike a keychain *read* it may
+/// fall back to the file key on failure: there is no ciphertext to orphan,
+/// and a headless session must still produce a working install. A concurrent
+/// first run that won the store race supplies its key instead.
+fn create_default_key(store: &dyn KeyStore) -> Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    match store.store(&key) {
+        Ok(()) => match store.fetch() {
+            Ok(Some(back)) if back == key => Ok(key),
+            // The item can't be read back as written. Left in place it would
+            // select a keychain backend that fails closed on every later run,
+            // so scrap it while nothing depends on it and use the file.
+            _ => {
+                let _ = store.delete();
+                load_or_create_file_key()
+            }
+        },
+        Err(_) => match store.fetch() {
+            Ok(Some(existing)) => Ok(existing),
+            _ => load_or_create_file_key(),
+        },
+    }
+}
+
+/// The real login-keychain store bound to the default home. Construction is
+/// inert (it wraps the home path; nothing touches the keychain until a
+/// method call), which is what lets tests cover it.
+#[cfg_attr(coverage, allow(dead_code))]
+fn default_home_store() -> Result<OsKeyStore> {
+    let home = config::canonical_home()?;
+    Ok(OsKeyStore::new(home.to_string_lossy().into_owned()))
+}
+
+/// Dispatch from the resolved backend to key material. Wiring only: two of
+/// the three arms construct the real login-keychain store, which tests must
+/// never open. The logic behind each arm is covered through mock stores
+/// (`create_default_key`, `keychain_key_from`) and the gate truth table
+/// (`keychain_is_first_run_default`).
+#[cfg(not(coverage))]
 fn load_or_create_key() -> Result<[u8; 32]> {
     config::ensure_home()?;
     match resolve_backend()? {
-        KeyBackend::File => load_or_create_file_key(),
-        KeyBackend::Keychain => {
-            let home = config::canonical_home()?;
-            keychain_key_from(&OsKeyStore::new(home.to_string_lossy().into_owned()))
+        KeyBackend::File if first_run_keychain_default()? => {
+            create_default_key(&default_home_store()?)
         }
+        KeyBackend::File => load_or_create_file_key(),
+        KeyBackend::Keychain => keychain_key_from(&default_home_store()?),
     }
+}
+
+/// Coverage builds (`cargo llvm-cov` sets `--cfg coverage`) swap the
+/// dispatcher for its file arm: the suite pins every run to a non-default
+/// home, which resolves to the file backend, so this is the exact path the
+/// real dispatcher takes under test; the keychain arms stay uninstrumented
+/// instead of showing up as permanently uncoverable lines in the diff gate.
+#[cfg(coverage)]
+fn load_or_create_key() -> Result<[u8; 32]> {
+    config::ensure_home()?;
+    load_or_create_file_key()
 }
 
 fn load_or_create_file_key() -> Result<[u8; 32]> {
@@ -582,6 +658,111 @@ mod tests {
         fn delete(&self) -> Result<bool> {
             Err(anyhow!("simulated keychain denial"))
         }
+    }
+
+    /// A store that accepts the write but reads back a different key, like a
+    /// keychain item some other process replaced between store and verify.
+    struct LyingStore {
+        deleted: RefCell<bool>,
+    }
+
+    impl KeyStore for LyingStore {
+        fn exists(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn fetch(&self) -> Result<Option<[u8; 32]>> {
+            Ok(Some([1u8; 32]))
+        }
+        fn store(&self, _key: &[u8; 32]) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&self) -> Result<bool> {
+            *self.deleted.borrow_mut() = true;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn first_run_keychain_gate_truth_table() {
+        let macos = cfg!(target_os = "macos");
+        // The one shape that mints in the keychain: default home, release
+        // build, nothing on disk yet (and only ever on macOS).
+        assert_eq!(keychain_is_first_run_default(true, true, false), macos);
+        // Overridden home (every test, the e2e script): never.
+        assert!(!keychain_is_first_run_default(false, true, false));
+        // Dev build: never (unsigned binaries re-prompt every rebuild).
+        assert!(!keychain_is_first_run_default(true, false, false));
+        // Existing file-backed install: never; migration is explicit.
+        assert!(!keychain_is_first_run_default(true, true, true));
+    }
+
+    #[test]
+    fn first_run_gate_is_closed_under_an_overridden_home() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+        assert!(!first_run_keychain_default().unwrap());
+        // Constructing the OS store is inert; only its methods reach the
+        // keychain, and no test may call those.
+        let _ = default_home_store().unwrap();
+    }
+
+    #[test]
+    fn fresh_default_key_lands_in_store_not_on_disk() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        let store = MemStore::empty();
+        let key = create_default_key(&store).unwrap();
+        assert_eq!(store.fetch().unwrap(), Some(key));
+        assert!(
+            !config::vault_key_path().unwrap().exists(),
+            "a keychain-minted key must leave no vault.key file"
+        );
+    }
+
+    #[test]
+    fn unavailable_keychain_at_creation_falls_back_to_file() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        let key = create_default_key(&DeniedStore).unwrap();
+        let on_disk = std::fs::read(config::vault_key_path().unwrap()).unwrap();
+        assert_eq!(on_disk, key, "creation-time fallback must mint a file key");
+    }
+
+    #[test]
+    fn losing_the_creation_race_adopts_the_winner_key() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        let winner = [9u8; 32];
+        let store = MemStore(RefCell::new(Some(winner)));
+        assert_eq!(create_default_key(&store).unwrap(), winner);
+        assert!(!config::vault_key_path().unwrap().exists());
+    }
+
+    #[test]
+    fn unverifiable_fresh_item_is_scrapped_and_file_wins() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        let store = LyingStore {
+            deleted: RefCell::new(false),
+        };
+        assert!(store.exists().unwrap(), "the lying item presents as present");
+        let key = create_default_key(&store).unwrap();
+        assert!(
+            *store.deleted.borrow(),
+            "an item that fails read-back verification must be removed, or \
+             every later run would select a keychain backend that fails closed"
+        );
+        let on_disk = std::fs::read(config::vault_key_path().unwrap()).unwrap();
+        assert_eq!(on_disk, key);
     }
 
     /// The test condition itself: every run with `DECOYRAIL_HOME` set (all of

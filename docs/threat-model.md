@@ -61,13 +61,9 @@ between interception and forwarding.
 
 ### A same-user attacker and `~/.decoyrail`
 
-The encrypted vault, CA key, and policy live in `~/.decoyrail`, owned by
-the user the agent runs as. By default the vault key (`vault.key`) sits
-beside them, so a prompt-injected agent can read both files and decrypt
-the vault offline; no tripwire fires, because nothing traversed the proxy.
+The encrypted vault, CA key, and policy live in `~/.decoyrail`, owned by the user the agent runs as. On the file backend (dev builds, overridden homes, installs that migrated back) the vault key (`vault.key`) sits beside them, so a prompt-injected agent can read both files and decrypt the vault offline; no tripwire fires, because nothing traversed the proxy.
 
-On macOS, `decoyrail key migrate --to keychain` closes the silent-read
-path: the key moves into a login-keychain item that only the Decoyrail
+On macOS the keychain backend closes the silent-read path: a release install starts there on first run, and `decoyrail key migrate --to keychain` moves an existing file key in. The key lives in a login-keychain item that only the Decoyrail
 binary reads without a prompt, bound to the default home. That binding
 also closes the rented-deputy variant, where the attacker never reads the
 key at all but copies the encrypted vault next to a hostile policy and

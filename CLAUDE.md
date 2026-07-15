@@ -103,8 +103,4 @@ modules so `tests/` can drive the pipeline in-process.
   a real secret rides it only to a releasing destination over TLS, exactly like
   a forwarded request; templates live in memory only, never on disk. Every
   injection and pre-warm is audited (`cache` / `keepalive`).
-- The keychain vault-key backend is presence-selected (item bound to the
-  default home exists), never a config flag, and is consulted only when
-  `DECOYRAIL_HOME` is unset or canonically equal to `~/.decoyrail`, so tests
-  and the e2e script always get the file backend. A selected-but-failed
-  keychain read aborts; it must never fall back to minting a fresh file key.
+- The keychain vault-key backend is presence-selected (item bound to the default home exists), never a config flag, and is consulted only when `DECOYRAIL_HOME` is unset or canonically equal to `~/.decoyrail`, so tests and the e2e script always get the file backend. A release build's first run against the default home mints the key directly in the keychain; dev builds stay on the file (unsigned binaries re-prompt every rebuild). A selected-but-failed keychain read aborts; it must never fall back to minting a fresh file key. The one permitted fallback is first-run creation (`create_default_key`): if the keychain write fails while nothing is encrypted yet, mint the file key instead. Coverage builds (`--cfg coverage`) swap `load_or_create_key` for its file arm so the untestable OS wiring stays out of the diff gate; the logic behind it is covered via mock stores.

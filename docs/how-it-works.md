@@ -295,7 +295,7 @@ are tightened on next run).
 |---|---|
 | `ca-cert.pem` / `ca-key.pem` | per-device CA (leaf certs minted per host); the key is `0600` |
 | `vault.json` | encrypted vault (ChaCha20-Poly1305) |
-| `vault.key` | vault key, `0600` (on macOS, `decoyrail key migrate --to keychain` moves it into the login keychain instead) |
+| `vault.key` | vault key, `0600`; absent when the key lives in the login keychain instead (release installs start there, `decoyrail key migrate` moves it either way) |
 | `policy.toml` | egress policy, human-editable |
 | `audit.jsonl` + `audit.head` | hash-chained audit log + head anchor |
 | `meter.json` / `budget.json` | per-host spend accounting (per-model token counts for LLM hosts) / monthly budget |

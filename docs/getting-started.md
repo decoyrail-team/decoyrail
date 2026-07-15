@@ -121,10 +121,7 @@ Now `decoyrail run -- claude` injects the decoy: Claude sees
 `ANTHROPIC_API_KEY=sk-ant-…DECOY`, `api.anthropic.com` receives your real
 key, and anywhere else the decoy shows up is blocked and recorded.
 
-Optional hardening on macOS: `decoyrail key migrate --to keychain` moves
-the vault's encryption key off disk and into the login keychain, where
-reading it silently is something only the Decoyrail binary can do. See
-[where the key lives](vault-and-bindings.md#where-the-key-lives-file-or-keychain).
+A release install keeps the vault's encryption key in the login keychain from the first run, where reading it silently is something only the Decoyrail binary can do. If yours started life as a dev build or an older release, `decoyrail key migrate --to keychain` moves the key off disk and in. See [where the key lives](vault-and-bindings.md#where-the-key-lives-file-or-keychain).
 
 ### Step 4: see what happened
 
@@ -378,8 +375,7 @@ It removes, in order:
 - the **Decoyrail CA** from your login keychain. It is identified by its
   SHA-1 fingerprint, never by name, so nothing else in your keychain can be
   touched, and running it again is harmless.
-- the **vault-key keychain item**, if you migrated the vault key to the
-  keychain with `decoyrail key migrate`.
+- the **vault-key keychain item**, if the vault key lives in the keychain (release installs start there; dev builds land there via `decoyrail key migrate`).
 - the whole **state directory** (`~/.decoyrail`): vault, CA material,
   policy, audit log, meter, and caches.
 

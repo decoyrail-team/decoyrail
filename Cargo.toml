@@ -47,6 +47,11 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+# cargo llvm-cov passes --cfg coverage; vault.rs swaps the keychain dispatcher
+# for its file arm there so untestable OS wiring stays out of the diff gate.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [profile.release]
 lto = true
 strip = true

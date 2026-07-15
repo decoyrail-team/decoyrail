@@ -22,20 +22,13 @@ flowchart LR
     decoy --> env["injected into the agent env<br/>by `decoyrail run`"]
 ```
 
-- **Encryption at rest:** the vault file is ChaCha20-Poly1305 encrypted. By
-  default the key lives beside it (`vault.key`, `0600`); on macOS you can
-  move it into the login keychain instead (next section). Moving the whole
-  directory out of the agent user's reach is a roadmap item; see the
-  [threat model](threat-model.md) for what this does and doesn't protect
-  today.
+- **Encryption at rest:** the vault file is ChaCha20-Poly1305 encrypted. On a release install (macOS, default home) the key starts in the login keychain; everywhere else it lives beside the vault (`vault.key`, `0600`), and `decoyrail key migrate` moves it either way (next section). Moving the whole directory out of the agent user's reach is a roadmap item; see the [threat model](threat-model.md) for what this does and doesn't protect today.
 - **Zeroization:** decrypted vault plaintext and key material are wiped
   after use.
 
 ## Where the key lives: file or keychain
 
-`vault.key` on disk is the default backend everywhere. It is simple and
-right for development, but any process running as your user can read it. On
-macOS you can move the key into the login keychain instead:
+A release build's first run on macOS against the default home mints the vault key directly in the login keychain; there is never a `vault.key` file to steal. Everywhere else (development builds, any overridden `DECOYRAIL_HOME`, and installs created before this default) the key is a file on disk: simple, but readable by any process running as your user. `decoyrail key migrate` moves an existing key in either direction:
 
 ```sh
 decoyrail key status                  # active backend, item presence, bound home
@@ -72,11 +65,9 @@ opposite `migrate`. If a keychain read is ever denied or fails, Decoyrail
 aborts rather than inventing a fresh key; a fresh key would present as an
 inexplicably empty vault and mask the failure.
 
-Development builds are unsigned, so the keychain identifies the binary
-itself and prompts again after every rebuild. Use the file backend in
-development and the keychain with an installed release. Any non-default
-`DECOYRAIL_HOME`, including tests and throwaway runs, always uses a file key
-inside that directory.
+First-run creation is the one moment with a fallback: if the keychain is unavailable when the very first key is minted (a headless SSH session, say), Decoyrail writes a `vault.key` file instead and carries on. Nothing is encrypted yet at that point, so no ciphertext can be orphaned; the strict no-fallback rule above guards reads of a key that already protects data.
+
+Development builds are unsigned, so the keychain identifies the binary itself and prompts again after every rebuild; that is why dev builds keep the file backend even on a first run. Upgrading a release install replaces the binary too, so expect a single consent prompt on the first read after an upgrade: approve it once and the new binary is trusted. Any non-default `DECOYRAIL_HOME`, including tests and throwaway runs, always uses a file key inside that directory.
 
 ## Decoys: deterministic, format-correct honeytokens
 
