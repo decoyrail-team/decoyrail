@@ -4,10 +4,10 @@ name: Deploy site
 # deploys it to the Cloudflare Pages project behind www.decoyrail.com, then
 # smoke-tests production.
 #
-# Runs on docs/site pushes, on manual dispatch, and as the last stage of the
-# Release workflow (workflow_call). The build pins the release tarball for
-# the version in Cargo.toml, so that release must already be published or
-# the build fails; a bare version bump therefore does not trigger this.
+# Runs on manual dispatch and as the last stage of the Release workflow
+# (workflow_call); it never fires on push, so merging to main does not
+# deploy. The build pins the release tarball for the version in Cargo.toml,
+# so that release must already be published or the build fails.
 #
 # Secrets: CLOUDFLARE_API_TOKEN (Account > Cloudflare Pages > Edit) and
 # CLOUDFLARE_ACCOUNT_ID.
@@ -15,12 +15,6 @@ name: Deploy site
 on:
   workflow_dispatch:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - site/**
-      - docs/**
-      - ROADMAP.md
 
 concurrency:
   group: deploy-site
