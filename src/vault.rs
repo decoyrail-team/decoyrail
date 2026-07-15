@@ -754,7 +754,10 @@ mod tests {
         let store = LyingStore {
             deleted: RefCell::new(false),
         };
-        assert!(store.exists().unwrap(), "the lying item presents as present");
+        assert!(
+            store.exists().unwrap(),
+            "the lying item presents as present"
+        );
         let key = create_default_key(&store).unwrap();
         assert!(
             *store.deleted.borrow(),
