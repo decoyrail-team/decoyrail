@@ -1,10 +1,13 @@
 name: Release
 
-# Manual release: build the macOS arm64 binary, then tag and publish a GitHub
-# release with checksums. Trigger from the Actions tab when you want to ship.
+# Manual release: build the macOS arm64 binary, tag and publish a GitHub
+# release with checksums, then update the Homebrew tap formula and deploy
+# decoyrail.com. Trigger from the Actions tab when you want to ship; the
+# tap and the site follow automatically.
 #
-# The decoyrail.com site (download page, embedded tarball) is deployed
-# separately; it pins the release published here by its sha256.
+# Secrets: TAP_TOKEN (a decoyrail-account token with contents write on
+# decoyrail-team/homebrew-tap) for the formula bump, plus the Cloudflare
+# pair the Deploy site workflow documents.
 
 on:
   workflow_dispatch:
@@ -61,13 +64,20 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
+        # Deterministic archive: same binary -> same bytes -> the published
+        # checksum is reproducible by anyone rebuilding the tagged source
+        # (pin mtime and owner, drop xattrs and the gzip timestamp, fixed
+        # member order). The macOS runner's tar is bsdtar, which these
+        # flags require.
         run: |
           version="${{ needs.check.outputs.version }}"
           name="decoyrail-v${version}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/decoyrail" "$name/"
           cp README.md LICENSE "$name/"
-          tar czf "$name.tar.gz" "$name"
+          touch -t 202601010000 "$name" "$name/decoyrail" "$name/README.md" "$name/LICENSE"
+          tar --no-xattrs --uid 0 --gid 0 --numeric-owner --options gzip:!timestamp \
+            -czf "$name.tar.gz" "$name/decoyrail" "$name/README.md" "$name/LICENSE"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -98,3 +108,83 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "decoyrail v${version}" \
             --generate-notes
+
+  tap:
+    # Point Formula/decoyrail.rb on the tap at the release published above.
+    # Goes through the Contents API with TAP_TOKEN, so commits are attributed
+    # to the decoyrail account and no tap clone is needed. Skipped when the
+    # formula already matches, so re-runs stay idempotent.
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Sync Formula/decoyrail.rb
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          tap_repo="decoyrail-team/homebrew-tap"
+          version="${{ needs.check.outputs.version }}"
+          tag="v${version}"
+          name="decoyrail-${tag}-aarch64-apple-darwin"
+          dl_url="https://github.com/${{ github.repository }}/releases/download/${tag}/${name}.tar.gz"
+          tarball_sha="$(cut -d' ' -f1 "dist/${name}.tar.gz.sha256")"
+          formula="$(cat <<EOF
+          class Decoyrail < Formula
+            desc "Endpoint firewall for AI agents: decoy secrets, egress policy, audit"
+            homepage "https://decoyrail.com"
+            url "${dl_url}"
+            sha256 "${tarball_sha}"
+            version "${version}"
+            license "FSL-1.1-Apache-2.0"
+
+            depends_on :macos
+            depends_on arch: :arm64
+
+            def install
+              bin.install "decoyrail"
+            end
+
+            def caveats
+              <<~EOS
+                To intercept TLS, trust the device CA once:
+                  decoyrail ca install
+                Remove everything Decoyrail installed with:
+                  decoyrail uninstall
+              EOS
+            end
+
+            test do
+              assert_match "#{version}", shell_output("#{bin}/decoyrail --version")
+            end
+          end
+          EOF
+          )"
+          current="$(gh api "repos/$tap_repo/contents/Formula/decoyrail.rb" --jq .content 2>/dev/null | base64 -d || true)"
+          if [ "$current" = "$formula" ]; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          existing_sha="$(gh api "repos/$tap_repo/contents/Formula/decoyrail.rb" --jq .sha 2>/dev/null || true)"
+          formula_b64="$(printf '%s\n' "$formula" | base64 | tr -d '\n')"
+          gh api -X PUT "repos/$tap_repo/contents/Formula/decoyrail.rb" \
+            -f message="decoyrail $tag" \
+            -f content="$formula_b64" \
+            ${existing_sha:+-f sha="$existing_sha"} >/dev/null
+          echo "tap updated: brew install decoyrail-team/tap/decoyrail"
+
+  site:
+    # Rebuild and deploy decoyrail.com; the build pins this release's tarball
+    # by its sha256 and the smoke test verifies the hosted digest. The
+    # concurrency group matches the standalone Deploy site runs (a called
+    # workflow's own workflow-level concurrency is not honored), so a release
+    # deploy never races a docs-push deploy.
+    needs: release
+    concurrency:
+      group: deploy-site
+      cancel-in-progress: false
+    uses: ./.github/workflows/deploy-site.yml
+    secrets: inherit
