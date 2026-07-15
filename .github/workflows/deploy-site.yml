@@ -1,0 +1,56 @@
+name: Deploy site
+
+# Builds site/ (landing page + docs rendered from this repo's markdown) and
+# deploys it to the Cloudflare Pages project behind www.decoyrail.com, then
+# smoke-tests production.
+#
+# Runs on docs/site pushes, on manual dispatch, and as the last stage of the
+# Release workflow (workflow_call). The build pins the release tarball for
+# the version in Cargo.toml, so that release must already be published or
+# the build fails; a bare version bump therefore does not trigger this.
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Account > Cloudflare Pages > Edit) and
+# CLOUDFLARE_ACCOUNT_ID.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - docs/**
+      - ROADMAP.md
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: |
+          npm --prefix site ci
+          node site/build.mjs
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >
+          npx --yes wrangler@4 pages deploy site/dist
+          --project-name decoyrail --branch main --commit-dirty=true
+
+      - name: Smoke test production
+        run: node site/smoke.mjs https://www.decoyrail.com
