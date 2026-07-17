@@ -234,8 +234,12 @@ impl Auditor {
     pub fn open() -> Result<Self> {
         config::ensure_home()?;
         let path = config::audit_path()?;
-        let (seq, prev_hash) = recover_tail(&path)?;
+        // Stat before scanning the tail. If another process appends between
+        // the two, known_len undercounts and the next append resyncs under
+        // its lock. The reverse order could pair a fresh length with a stale
+        // tail, so append would skip the resync and fork the chain.
         let known_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let (seq, prev_hash) = recover_tail(&path)?;
         Ok(Self {
             seq,
             prev_hash,
@@ -593,6 +597,53 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(verify().unwrap(), 201);
+    }
+
+    #[test]
+    fn open_mid_append_does_not_fork_the_chain() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // One long-lived auditor (the proxy) appends while other "processes"
+        // open fresh auditors and append (`decoyrail run` starting up). `open`
+        // stats the file before scanning the tail; pairing a fresh length
+        // with a stale tail would make append skip its under-lock resync and
+        // chain from a stale hash, forking the chain for good.
+        let writer = std::thread::spawn(move || {
+            let mut a = Auditor::open().unwrap();
+            for i in 0..100 {
+                a.append(
+                    Entry {
+                        host: format!("w{i}"),
+                        action: "allow".into(),
+                        ..Default::default()
+                    },
+                    format!("t{i}"),
+                )
+                .unwrap();
+            }
+        });
+        let mut opened = 0u64;
+        loop {
+            let done = writer.is_finished();
+            let mut b = Auditor::open().unwrap();
+            b.append(
+                Entry {
+                    host: "opener".into(),
+                    action: "allow".into(),
+                    ..Default::default()
+                },
+                "t".into(),
+            )
+            .unwrap();
+            opened += 1;
+            if done {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(verify().unwrap(), 100 + opened);
     }
 
     #[test]

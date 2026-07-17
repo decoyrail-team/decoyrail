@@ -740,6 +740,11 @@ pub struct SessionOut {
 /// Run one analytics query: catch the cache up with any new audit lines,
 /// persist it, then aggregate the window. Purely local, no network.
 pub fn query(window: &Window) -> Result<Report> {
+    // Snapshot the anchor before reading the log. An append writes the log
+    // line first, then the anchor; reading in the opposite order here would
+    // let an append land in between, presenting a healthy log as truncated —
+    // the same mid-append race `audit::verify` takes a shared lock against.
+    let anchor = audit::head_anchor();
     let agg = load_and_catch_up()?;
 
     // Tail truncation leaves a valid prefix chain; the head anchor knows how
@@ -747,7 +752,7 @@ pub fn query(window: &Window) -> Result<Report> {
     // mid-chain break, it heals if the log grows back past the anchor.)
     let mut integrity = agg.integrity.clone();
     if integrity.is_none() {
-        if let Some((anchor_seq, _)) = audit::head_anchor() {
+        if let Some((anchor_seq, _)) = anchor {
             if agg.last_seq.map(|s| s < anchor_seq).unwrap_or(true) {
                 integrity = Some(format!(
                     "audit log truncated: head anchor expects seq {anchor_seq} but log ends at {}",
@@ -1611,6 +1616,51 @@ mod tests {
             .unwrap()
             .contains("truncated"));
         assert_eq!(report.totals.requests, 2, "prefix still reported");
+    }
+
+    #[test]
+    fn query_never_false_alarms_during_appends() {
+        let (_g, _dir) = setup();
+        let mut a = Auditor::open().unwrap();
+        a.append(
+            Entry {
+                host: "seed".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                ..Default::default()
+            },
+            "2026-06-05T10:00:00.000Z".into(),
+        )
+        .unwrap();
+
+        // A live proxy keeps appending while `decoyrail stats` runs. The
+        // anchor is snapshotted before the log is read; sampling it after
+        // would let an append land in between, and the fresher anchor would
+        // present the healthy log as truncated.
+        let writer = std::thread::spawn(move || {
+            for i in 1..=200 {
+                a.append(
+                    Entry {
+                        host: format!("h{i}"),
+                        action: "allow".into(),
+                        sid: "s1".into(),
+                        ..Default::default()
+                    },
+                    "2026-06-05T10:00:01.000Z".into(),
+                )
+                .unwrap();
+            }
+        });
+        while !writer.is_finished() {
+            let report = query(&wide()).unwrap();
+            assert!(
+                report.integrity.ok,
+                "stats raced a concurrent append: {:?}",
+                report.integrity.detail
+            );
+        }
+        writer.join().unwrap();
+        assert_eq!(query(&wide()).unwrap().totals.requests, 201);
     }
 
     #[test]
