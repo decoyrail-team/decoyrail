@@ -186,85 +186,100 @@ ${topnav('')}
 <main>
 <section class="hero">
   <p class="kicker">Endpoint firewall for AI agents</p>
-  <h1>Your agent works with decoys, not your real secrets.<br>And you find out the moment one heads somewhere it shouldn't.</h1>
-  <p class="lede">Decoyrail runs coding agents (Claude Code, Codex CLI, anything)
-  behind a local TLS-intercepting proxy. The agent's environment gets
-  <strong>decoy credentials</strong>; the proxy swaps in the real secret only for
-  each secret's approved destination, default-denies everything off-policy, and
-  treats a decoy seen heading anywhere else as a live <strong>exfiltration
-  tripwire</strong>. One offline-capable binary.</p>
+  <h1>Your coding agent works with decoy credentials.<br>Real secrets never enter its environment.</h1>
+  <p class="lede">Decoyrail is a single binary that runs Claude Code, Codex CLI,
+  or any coding agent behind a local proxy. The agent holds
+  <strong>decoys</strong>. The proxy swaps in the real secret only for that
+  secret's approved destination, blocks everything else, and raises an alarm
+  the moment a decoy heads anywhere it should not. If the agent is tricked
+  into leaking a key, the key it leaks works nowhere.</p>
   <p class="cta">
     <a class="btn primary" href="#download">Install for macOS</a>
     <a class="btn" href="docs/getting-started">Get started in 5 minutes</a>
   </p>
 </section>
 
+<section class="demo">
+  <h2>Watch it catch an exfiltration</h2>
+  <p>A prompt injection tells the agent to send its AWS key somewhere it
+  should not go. The key the agent holds is a decoy, so the request is blocked
+  and the attempt lands in the log:</p>
+  <figure><img src="docs/demos/tripwire.gif" width="1200" height="640"
+    alt="A decoy AWS key sent to an unapproved host is blocked, and decoyrail log records the exfiltration attempt"></figure>
+</section>
+
 <section class="terminal-demo">
+  <h2>The whole setup is one command</h2>
 <pre class="code"><code><span class="dim"># Run your agent behind Decoyrail. With a Claude subscription this is
-# the whole setup: default-deny egress, an audit log, and every
-# credential-looking env var in your terminal auto-decoyed.</span>
+# everything: default-deny egress, an audit log, and every
+# credential-looking env var in your terminal replaced with a decoy.</span>
 $ decoyrail run -- claude
 
-<span class="dim"># Only if you pay per token with an API key: vault it, bound to its one
-# legitimate destination. The agent then sees a decoy;
-# api.anthropic.com sees the real key.</span>
-$ decoyrail vault add --name anthropic --env ANTHROPIC_API_KEY \\
-    --host api.anthropic.com --location bearer
+<span class="dim"># In a second terminal, watch every decision live.</span>
+$ decoyrail log -t
+<span class="ok">allow</span>     api.anthropic.com POST /v1/messages
+<span class="alarm">tripwire</span>  decoy 'aws' seen toward evil.example.com: blocked
 
-<span class="dim"># A prompt-injected exfil attempt trips the wire instead of leaking.</span>
-$ decoyrail log -n 1
-<span class="alarm">tripwire</span>  decoy 'anthropic' seen toward evil.example.com: blocked</code></pre>
+<span class="dim"># Only if you pay per token with an API key: vault it. The agent then
+# sees a decoy; api.anthropic.com receives the real key.</span>
+$ decoyrail vault add --name anthropic --env ANTHROPIC_API_KEY --location bearer</code></pre>
+  <p class="note">No vault setup is needed for the common case.
+  <code>decoyrail run</code> spots credential-looking variables in your
+  terminal (<code>AWS_SECRET_ACCESS_KEY</code>, <code>GITHUB_TOKEN</code>, and
+  so on) and hands the agent decoys automatically:</p>
+  <figure><img src="docs/demos/auto-decoy.gif" width="1200" height="640"
+    alt="decoyrail run replaces sensitive env vars with decoys before launching the agent"></figure>
 </section>
 
 <section class="cols3">
-  <div><h3>Decoys, not redaction</h3><p>Real secrets are encrypted at rest and
-  exist only inside the proxy, between interception and forwarding. Agents, logs,
-  prompts, and crash dumps can only ever contain format-correct fakes
-  (<code>sk-ant-…</code>, <code>ghp_…</code>, <code>AKIA…</code>) that stock SDKs
-  accept without special-casing.</p></div>
-  <div><h3>Swap scoped by binding</h3><p>The decoy-to-real substitution happens
-  only when host, path, method, and location all match the secret's binding, and
-  only over verified TLS. The upstream client follows no redirects, so a real
-  secret can't be bounced somewhere policy never evaluated.</p></div>
-  <div><h3>Detection for free</h3><p>Decoys are honeytokens. One headed anywhere
-  outside its binding, even base64, hex, or percent-encoded, is blocked and
-  alarmed. Whoever steals a decoy tells you so the moment they try to use
-  it.</p></div>
+  <div><h3>Decoys, not redaction</h3><p>Real secrets stay encrypted on disk
+  and exist only inside the proxy. The agent, its logs, its prompts, and its
+  crash dumps can only ever contain fakes that look real
+  (<code>sk-ant-…</code>, <code>ghp_…</code>, <code>AKIA…</code>), so stock
+  SDKs accept them without any special-casing.</p></div>
+  <div><h3>The swap is narrow</h3><p>The real secret goes out only when the
+  host, path, method, and location all match what you bound it to, and only
+  over verified TLS. The proxy never follows a redirect, so a secret cannot
+  be bounced somewhere the policy never looked at.</p></div>
+  <div><h3>Stolen decoys tell on the thief</h3><p>Every decoy is a honeytoken.
+  If one shows up outside its binding, even base64, hex, or percent-encoded,
+  the request is blocked and the alarm is logged. You find out the moment
+  anyone tries to use it.</p></div>
 </section>
 
 <section class="features">
   <h2>What's in the box</h2>
   <div class="grid">
-    <div><h4>Default-deny egress policy</h4><p>Rules-first allow/deny/escalate with
-    path-prefix matching and a "Claude Code safe defaults" pack. <code>escalate</code>
-    fails closed.</p></div>
-    <div><h4>TLS interception done carefully</h4><p>Per-device CA, per-host leaf
-    certs. Upstream is a fresh, fully verified TLS session; enterprise internal
-    CAs are additive, never a verification bypass.</p></div>
-    <div><h4>Streaming untouched</h4><p>SSE token streams pass through with no
-    buffering; bounded responses are scanned for echoed real secrets.</p></div>
-    <div><h4>Tamper-evident audit</h4><p>Append-only, hash-chained, head-anchored
-    JSONL. <code>decoyrail log --verify</code> catches edits, mid-file deletions,
-    and tail truncation.</p></div>
-    <div><h4>Spend metering &amp; budget</h4><p>Per-destination accounting, a
-    monthly budget, and a kill switch that denies once it's exhausted.</p></div>
-    <div><h4>Offline by design</h4><p>A single Rust binary. No hosted control
-    plane, no phone-home. Nothing about your traffic ever flows to us.</p></div>
+    <div><h4>Default-deny egress policy</h4><p>Nothing leaves unless a rule
+    allows it, and the rule that allows a destination also says which secrets
+    it releases. A starter pack covers what coding agents need.</p></div>
+    <div><h4>TLS interception done carefully</h4><p>A CA minted on your device,
+    per-host certificates, and a fresh, fully verified connection upstream.
+    Enterprise internal CAs are additive, never a bypass.</p></div>
+    <div><h4>Streaming stays fast</h4><p>Token streams pass through untouched.
+    Bounded responses are scanned for echoed real secrets.</p></div>
+    <div><h4>An audit log you can trust</h4><p>Append-only and hash-chained.
+    <code>decoyrail log --verify</code> catches edits, deletions, and
+    truncation.</p></div>
+    <div><h4>Spend metering &amp; budget</h4><p>Exact per-model token counts,
+    a monthly budget, and a kill switch that denies requests once the budget
+    is spent.</p></div>
+    <div><h4>Offline by design</h4><p>No account, no server, no telemetry.
+    Nothing about your traffic ever reaches us.</p></div>
   </div>
 </section>
 
 <section class="honesty">
   <h2>An honest threat model</h2>
   <p>Today Decoyrail runs as your user and guards the network path your agent
-  is configured through. That defends against accidental secret inclusion,
-  prompt-injected exfiltration to unapproved destinations, off-policy egress,
-  and audit-history tampering. It is <strong>not</strong> yet an enforceable
-  boundary against hostile code running as you: a same-user process can still
-  read <code>~/.decoyrail</code> off disk or edit the policy (the privileged
-  system mode on the roadmap closes that). Proxy bypass gains an attacker
-  nothing but a failed request carrying a useless decoy; cert-pinned apps get
-  allow/deny only. For a security product, the limits are part of the product:
-  <a href="docs/threat-model">read the full threat model</a>.</p>
+  is configured through. That covers accidental secret leaks, prompt-injected
+  exfiltration, off-policy egress, and audit-history tampering. It is
+  <strong>not</strong> yet a boundary against hostile code running as you: a
+  same-user process can still read <code>~/.decoyrail</code> off disk or edit
+  the policy (the privileged system mode on the roadmap closes that). An agent
+  that sidesteps the proxy gains nothing: its requests fail, and the decoys it
+  carries work nowhere. For a security product, the limits are part of the
+  product: <a href="docs/threat-model">read the full threat model</a>.</p>
 </section>
 
 <section id="download" class="download">
@@ -278,8 +293,7 @@ decoyrail ca install
 decoyrail run -- claude
 
 <span class="dim"># only if you use an API key instead of a subscription:</span>
-decoyrail vault add --name anthropic --env ANTHROPIC_API_KEY \\
-    --host api.anthropic.com --location bearer</code></pre>
+decoyrail vault add --name anthropic --env ANTHROPIC_API_KEY --location bearer</code></pre>
   <p class="note">No Homebrew? Download
   <a href="${DL_URL}">${TARBALL}</a> from the
   <a href="${RELEASE_URL}">GitHub release</a>
