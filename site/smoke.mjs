@@ -14,7 +14,7 @@
 //   - security headers are present
 //   - the release tarball on the tap repo's GitHub release (the URL the site
 //     and the Homebrew formula share) downloads and matches the manifest sha256
-//   - robots.txt still carries the pre-launch disallow (remove at launch)
+//   - robots.txt allows indexing and the sitemap covers every route
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +38,27 @@ const ok = (cond, what) => {
 };
 
 const get = (path) => fetch(BASE + path, { redirect: 'follow' });
+
+// A Pages deployment goes live on the custom domain asynchronously after
+// `wrangler pages deploy` returns, so wait for the landing page to serve this
+// build's version before asserting anything; on timeout fall through and let
+// the checks report the stale state.
+{
+  const want = `v${manifest.version}`;
+  const deadline = Date.now() + 90_000;
+  while (true) {
+    try {
+      const body = await (await get('/')).text();
+      if (body.includes(want)) break;
+    } catch {}
+    if (Date.now() > deadline) {
+      console.error(`smoke: / still not serving ${want} after 90s; asserting anyway`);
+      break;
+    }
+    console.log(`  ...  / not yet serving ${want}; retrying in 5s`);
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
 
 for (const { path, marker } of manifest.routes) {
   const res = await get(path);
@@ -75,8 +96,17 @@ for (const { path, marker } of manifest.routes) {
 {
   const res = await get('/robots.txt');
   const body = await res.text();
-  ok(res.status === 200 && /Disallow: \//.test(body),
-    'robots.txt still disallows indexing (pre-launch; drop this check at public launch)');
+  ok(res.status === 200 && /Allow: \//.test(body) && !/Disallow: \//.test(body),
+    'robots.txt allows indexing');
+  ok(/Sitemap: .*\/sitemap\.xml/.test(body), 'robots.txt points at the sitemap');
+}
+
+{
+  const res = await get('/sitemap.xml');
+  const body = await res.text();
+  ok(res.status === 200, `sitemap.xml returns 200 (got ${res.status})`);
+  ok(manifest.routes.every(({ path }) => body.includes(`<loc>https://www.decoyrail.com${path}</loc>`)),
+    'sitemap.xml lists every route');
 }
 
 if (failures.length) {

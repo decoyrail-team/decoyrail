@@ -609,7 +609,7 @@ const MANIFEST = {
 };
 writeFileSync(join(DIST, 'routes.json'), JSON.stringify(MANIFEST, null, 2) + '\n');
 
-// Cloudflare Pages extras: security headers + keep crawlers off until launch.
+// Cloudflare Pages extras: security headers.
 writeFileSync(join(DIST, '_headers'), `/*
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
@@ -619,7 +619,15 @@ writeFileSync(join(DIST, '_headers'), `/*
 // Old bookmarked download links: send them to the release listing.
 writeFileSync(join(DIST, '_redirects'),
   `/download/* https://github.com/${SRC_REPO}/releases/latest 302\n`);
-// Pre-launch: keep the site unindexed. Remove at public launch.
-writeFileSync(join(DIST, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
+// Public launch: invite crawlers, and give them a sitemap built from the
+// same route manifest the smoke test asserts.
+const ORIGIN = 'https://www.decoyrail.com';
+writeFileSync(join(DIST, 'robots.txt'),
+  `User-agent: *\nAllow: /\n\nSitemap: ${ORIGIN}/sitemap.xml\n`);
+writeFileSync(join(DIST, 'sitemap.xml'),
+  '<?xml version="1.0" encoding="UTF-8"?>\n' +
+  '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+  MANIFEST.routes.map((r) => `  <url><loc>${ORIGIN}${r.path}</loc></url>`).join('\n') +
+  '\n</urlset>\n');
 
 console.log(`built dist/: decoyrail v${VERSION}, ${TARBALL} sha256 ${SHA}`);
