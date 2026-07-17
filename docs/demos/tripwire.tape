@@ -2,6 +2,11 @@
 # and recorded as an exfiltration attempt.
 # Regenerate with scripts/render-demos.sh (run from the repo root).
 
+# Frame matches decoyrail.com (paper-and-ink theme), overriding the preset's
+# purple margin and rounded corners.
+Set MarginFill "#171914"
+Set BorderRadius 0
+
 # Invisible setup: fresh throwaway state, no inherited proxies or real keys,
 # and one warmup run so CA generation doesn't stall the visible part.
 Hide

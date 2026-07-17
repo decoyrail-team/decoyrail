@@ -20,7 +20,7 @@ A typical report:
 
 ```
 Window: today (2026-07-10T04 to 2026-07-11T04 UTC)
-Requests: 41 (39 allowed, 2 denied: 1 policy, 1 tripwire, 0 dlp, 0 budget)
+Requests: 41 (39 allowed, 0 warned, 2 denied: 1 policy, 1 tripwire, 0 dlp, 0 budget)
 Security: 1 tripwire hits, 0 DLP alerts
 Tokens: in 48.2k  out 12.9k  cache read 1.1M  cache write 22.0k  cached 96%
 Spend: $1.8420
@@ -103,8 +103,8 @@ total tokens, dollars, and alert count, in that order.
 1.2M tok  $4.31  3 alerts
 ```
 
-The alert count is denies plus tripwire hits plus DLP alerts, each event
-counted once. If the audit chain fails verification the line is prefixed
+The alert count is denies plus tripwire hits plus DLP alerts plus warn
+events, each counted once. If the audit chain fails verification the line is prefixed
 with `[audit integrity FAILED] `. This format is a compatibility promise:
 poll it from a menu bar app or a statusline every few seconds and nothing
 about it will change shape within a major version. For anything richer, use
@@ -137,6 +137,7 @@ rows alike, has the same shape:
 | Field | Meaning |
 |---|---|
 | `requests`, `allows` | requests seen, requests forwarded |
+| `warns` | requests forwarded under the [`warn` action](policy.md#warn-forward-but-say-so): the per-host rows answer "what would break under default deny" (added in a v1-compatible way; absent means an older binary) |
 | `denies` | `{total, policy, tripwire, dlp, budget}`, denies by reason |
 | `tripwires` | tripwire hits: request-side denies plus response echoes |
 | `dlp_alerts` | DLP warn or mask hits (blocking hits are in `denies.dlp`) |

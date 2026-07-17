@@ -101,10 +101,11 @@ impl Outcome {
 /// Apply the vault against a request. Where the winning policy rule releases
 /// a secret, its decoy is replaced with the real value in place. A decoy the
 /// rule does not expect is left untouched and recorded as a tripwire (the
-/// caller decides to block). A decoy the rule lists but does not release
-/// (deny/escalate carve-outs) is left untouched *quietly*: the request is
-/// already blocked by policy, and the agent's own credential riding it is
-/// not an exfiltration signal.
+/// caller decides to block). A decoy the rule lists but does not release is
+/// left untouched *quietly*: on a deny/escalate carve-out the request is
+/// already blocked by policy, and on a warn rule it forwards with the decoy
+/// still in place — either way the agent's own credential is not an
+/// exfiltration signal, and only allow ever swaps.
 ///
 /// `allow_swap` gates substitution by transport: over plaintext HTTP the
 /// caller passes `false`, and any decoy — even toward a releasing rule —
@@ -122,8 +123,9 @@ pub fn apply(
         let released = decision.releases(secret);
         let expected = decision.expects(secret);
         let approved = allow_swap && released;
-        // Listed on a blocking rule: no swap, and no honeytoken alarm for
-        // literal sightings in swappable locations.
+        // Listed on a rule that doesn't release (deny/escalate carve-out, or
+        // a warn rule): no swap, and no honeytoken alarm for literal
+        // sightings in swappable locations.
         let quiet = expected && !released;
         // Why a sighting at a swap-eligible spot still tripwires: destination
         // first (most common), then transport; a location mismatch is the only
@@ -443,6 +445,47 @@ mod tests {
             "expected credential must not raise the alarm"
         );
         assert_eq!(ctx.headers[0].1, format!("Bearer {decoy}"));
+    }
+
+    #[test]
+    fn warn_rule_listing_the_secret_forwards_the_decoy_quietly() {
+        let (vault, decoy) = vault_with(Location::Bearer);
+        let mut ctx = RequestCtx {
+            host: "watched.example.com".into(),
+            path: "/v1/x".into(),
+            method: "POST".into(),
+            headers: vec![("authorization".into(), format!("Bearer {decoy}"))],
+            body: Vec::new(),
+        };
+        // A warn rule that lists the secret: the request forwards, but the
+        // destination receives the decoy — no release, no alarm.
+        let out = apply(
+            &mut ctx,
+            &vault,
+            &decision(Action::Warn, &["anthropic"]),
+            true,
+        );
+        assert!(out.swaps.is_empty(), "warn must never swap");
+        assert!(!out.tripped(), "listed secret must not raise the alarm");
+        assert_eq!(ctx.headers[0].1, format!("Bearer {decoy}"));
+    }
+
+    #[test]
+    fn unexpected_decoy_tripwires_under_warn() {
+        let (vault, decoy) = vault_with(Location::Bearer);
+        let mut ctx = RequestCtx {
+            host: "unknown.example.com".into(),
+            path: "/x".into(),
+            method: "POST".into(),
+            headers: vec![("authorization".into(), format!("Bearer {decoy}"))],
+            body: Vec::new(),
+        };
+        // Watch mode does not weaken the tripwire: a decoy the warn decision
+        // does not expect is still a honeytoken sighting.
+        let out = apply(&mut ctx, &vault, &decision(Action::Warn, &[]), true);
+        assert!(out.tripped());
+        assert!(out.swaps.is_empty());
+        assert_eq!(out.tripwires[0].reason, TripReason::UnreleasedDestination);
     }
 
     #[test]

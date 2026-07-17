@@ -104,6 +104,11 @@ impl DurStat {
 pub struct Bucket {
     pub requests: u64,
     pub allows: u64,
+    /// Warn resolutions: forwarded with a recorded alert (plan 017). Their
+    /// own category so "what would break if I went back to deny" is
+    /// answerable per host. serde(default) keeps pre-warn caches loading.
+    #[serde(default)]
+    pub warns: u64,
     pub denies: u64,
     pub deny_policy: u64,
     pub deny_tripwire: u64,
@@ -130,6 +135,7 @@ impl Bucket {
     fn merge(&mut self, o: &Bucket) {
         self.requests += o.requests;
         self.allows += o.allows;
+        self.warns += o.warns;
         self.denies += o.denies;
         self.deny_policy += o.deny_policy;
         self.deny_tripwire += o.deny_tripwire;
@@ -183,6 +189,10 @@ struct PendingReq {
     /// The allow event's upload size, moved along with the request when it
     /// resolves to a model row.
     bytes_up: u64,
+    /// True when the pending request was a warn resolution, so its follow-up
+    /// usage event moves the right counter.
+    #[serde(default)]
+    warn: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -320,7 +330,10 @@ impl Aggregator {
                     );
                 }
             }
-            "allow" => {
+            // A warn is a forwarded request like an allow — same traffic,
+            // usage, and correlation handling — counted in its own category.
+            "allow" | "warn" => {
+                let warn = ev.action == "warn";
                 let model = ev
                     .usage
                     .as_ref()
@@ -328,7 +341,11 @@ impl Aggregator {
                     .unwrap_or_default();
                 let b = self.bucket(&hour, &ev.sid, &ev.host, &model);
                 b.requests += 1;
-                b.allows += 1;
+                if warn {
+                    b.warns += 1;
+                } else {
+                    b.allows += 1;
+                }
                 b.bytes_up += ev.bytes_up;
                 b.bytes_down += ev.bytes_down;
                 if let Some(ms) = ev.dur_ms {
@@ -356,6 +373,7 @@ impl Aggregator {
                                     sid: ev.sid.clone(),
                                     host: ev.host.clone(),
                                     bytes_up: ev.bytes_up,
+                                    warn,
                                 },
                             );
                             while self.pending.len() > PENDING_CAP {
@@ -414,12 +432,20 @@ impl Aggregator {
             (Some(base), Some(u)) => {
                 let from = self.bucket(&base.hour, &base.sid, &base.host, "");
                 from.requests = from.requests.saturating_sub(1);
-                from.allows = from.allows.saturating_sub(1);
+                if base.warn {
+                    from.warns = from.warns.saturating_sub(1);
+                } else {
+                    from.allows = from.allows.saturating_sub(1);
+                }
                 from.no_usage = from.no_usage.saturating_sub(1);
                 from.bytes_up = from.bytes_up.saturating_sub(base.bytes_up);
                 let to = self.bucket(&base.hour, &base.sid, &base.host, &model);
                 to.requests += 1;
-                to.allows += 1;
+                if base.warn {
+                    to.warns += 1;
+                } else {
+                    to.allows += 1;
+                }
                 to.bytes_up += base.bytes_up;
                 to.input_tokens += u.input;
                 to.output_tokens += u.output;
@@ -621,6 +647,9 @@ pub struct DurOut {
 pub struct BucketOut {
     pub requests: u64,
     pub allows: u64,
+    /// Forwarded-with-alert resolutions (action `warn`); additive to schema
+    /// v1, so existing consumers are unaffected.
+    pub warns: u64,
     pub denies: DeniesOut,
     pub tripwires: u64,
     pub dlp_alerts: u64,
@@ -638,6 +667,7 @@ impl BucketOut {
         BucketOut {
             requests: b.requests,
             allows: b.allows,
+            warns: b.warns,
             denies: DeniesOut {
                 total: b.denies,
                 policy: b.deny_policy,
@@ -674,11 +704,16 @@ impl BucketOut {
     }
 
     /// Alerts a surface should surface: everything denied plus everything
-    /// that fired while traffic flowed. Tripwire denies live in both the
-    /// deny and tripwire counters, so they are subtracted back out; each
-    /// security event counts once. This is the `--line` alert count.
+    /// that fired while traffic flowed — DLP advisories, response-echo
+    /// tripwires, and warn resolutions (forwarded, but each one recorded an
+    /// alert by design). Tripwire denies live in both the deny and tripwire
+    /// counters, so they are subtracted back out; each security event counts
+    /// once. This is the `--line` alert count.
     pub fn alert_count(&self) -> u64 {
-        self.denies.total + self.dlp_alerts + self.tripwires.saturating_sub(self.denies.tripwire)
+        self.denies.total
+            + self.dlp_alerts
+            + self.warns
+            + self.tripwires.saturating_sub(self.denies.tripwire)
     }
 }
 
@@ -705,6 +740,11 @@ pub struct SessionOut {
 /// Run one analytics query: catch the cache up with any new audit lines,
 /// persist it, then aggregate the window. Purely local, no network.
 pub fn query(window: &Window) -> Result<Report> {
+    // Snapshot the anchor before reading the log. An append writes the log
+    // line first, then the anchor; reading in the opposite order here would
+    // let an append land in between, presenting a healthy log as truncated —
+    // the same mid-append race `audit::verify` takes a shared lock against.
+    let anchor = audit::head_anchor();
     let agg = load_and_catch_up()?;
 
     // Tail truncation leaves a valid prefix chain; the head anchor knows how
@@ -712,7 +752,7 @@ pub fn query(window: &Window) -> Result<Report> {
     // mid-chain break, it heals if the log grows back past the anchor.)
     let mut integrity = agg.integrity.clone();
     if integrity.is_none() {
-        if let Some((anchor_seq, _)) = audit::head_anchor() {
+        if let Some((anchor_seq, _)) = anchor {
             if agg.last_seq.map(|s| s < anchor_seq).unwrap_or(true) {
                 integrity = Some(format!(
                     "audit log truncated: head anchor expects seq {anchor_seq} but log ends at {}",
@@ -951,9 +991,10 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
     let _ = writeln!(out, "Window: {window_desc}");
     let _ = writeln!(
         out,
-        "Requests: {} ({} allowed, {} denied: {} policy, {} tripwire, {} dlp, {} budget)",
+        "Requests: {} ({} allowed, {} warned, {} denied: {} policy, {} tripwire, {} dlp, {} budget)",
         t.requests,
         t.allows,
+        t.warns,
         t.denies.total,
         t.denies.policy,
         t.denies.tripwire,
@@ -1062,18 +1103,20 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
             .cache_hit_ratio
             .map(|r| format!("  cached {:.0}%", r * 100.0))
             .unwrap_or_default();
+        // Warned counts print by name so "which hosts ride the warn default"
+        // is answerable straight off the --by host table.
+        let alert_chip = match (alerts > 0, s.warns > 0) {
+            (true, true) => format!("  [{alerts} alerts, {} warned]", s.warns),
+            (true, false) => format!("  [{alerts} alerts]"),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "  {name:<name_w$}  {:>5} req  in {:>8}  out {:>8}  ${:.4}{cached}{}",
+            "  {name:<name_w$}  {:>5} req  in {:>8}  out {:>8}  ${:.4}{cached}{alert_chip}",
             s.requests,
             fmt_tokens(s.tokens.input + s.tokens.cache_read + s.tokens.cache_write),
             fmt_tokens(s.tokens.output),
             s.cost_usd,
-            if alerts > 0 {
-                format!("  [{alerts} alerts]")
-            } else {
-                String::new()
-            }
         );
     }
     out
@@ -1252,6 +1295,130 @@ mod tests {
         assert_eq!(june.totals.denies.dlp, 0);
         let human = render_human(&june, Breakdown::Model);
         assert!(human.contains("0 dlp"), "zeros must print:\n{human}");
+    }
+
+    #[test]
+    fn warn_events_are_their_own_category_with_per_host_detail() {
+        let (_g, _dir) = setup();
+        let mut a = Auditor::open().unwrap();
+        for host in [
+            "unknown-a.example",
+            "unknown-a.example",
+            "unknown-b.example",
+        ] {
+            a.append(
+                Entry {
+                    host: host.into(),
+                    action: "warn".into(),
+                    rule: "default".into(),
+                    sid: "s1".into(),
+                    dur_ms: Some(30),
+                    bytes_up: 100,
+                    bytes_down: 200,
+                    ..Default::default()
+                },
+                "2026-06-05T10:00:00.000Z".into(),
+            )
+            .unwrap();
+        }
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                dur_ms: Some(50),
+                ..Default::default()
+            },
+            "2026-06-05T10:01:00.000Z".into(),
+        )
+        .unwrap();
+
+        let report = query(&wide()).unwrap();
+        let t = &report.totals;
+        assert_eq!(t.requests, 4);
+        assert_eq!(t.allows, 1);
+        assert_eq!(t.warns, 3, "warns count in their own category");
+        assert_eq!(t.denies.total, 0);
+        // Warn records an alert by design, so it surfaces in the alert count.
+        assert_eq!(t.alert_count(), 3);
+        // "What would break if I went back to deny": per-host warn counts.
+        let host_a = report
+            .by_host
+            .iter()
+            .find(|h| h.name == "unknown-a.example")
+            .unwrap();
+        assert_eq!(host_a.stats.warns, 2);
+        let host_b = report
+            .by_host
+            .iter()
+            .find(|h| h.name == "unknown-b.example")
+            .unwrap();
+        assert_eq!(host_b.stats.warns, 1);
+        assert_eq!(
+            report
+                .by_host
+                .iter()
+                .find(|h| h.name == "api.anthropic.com")
+                .unwrap()
+                .stats
+                .warns,
+            0
+        );
+        let human = render_human(&report, Breakdown::Host);
+        assert!(
+            human.contains("3 warned"),
+            "totals name the warns:\n{human}"
+        );
+        assert!(
+            human.contains("2 warned"),
+            "per-host rows name the warns:\n{human}"
+        );
+        let json = render_json(&report).unwrap();
+        assert!(json.contains("\"warns\": 3"), "{json}");
+    }
+
+    #[test]
+    fn streamed_warn_usage_counts_exactly_once() {
+        let (_g, _dir) = setup();
+        let mut a = Auditor::open().unwrap();
+        // A streamed warn (LLM traffic riding a warn resolution): the allow
+        // event's warn twin, then the deferred usage event referencing it.
+        a.append(
+            Entry {
+                host: "llm.example".into(),
+                action: "warn".into(),
+                rule: "default".into(),
+                sid: "s1".into(),
+                bytes_up: 500,
+                ..Default::default()
+            },
+            "2026-06-05T10:00:00.000Z".into(),
+        )
+        .unwrap();
+        a.append(
+            Entry {
+                host: "llm.example".into(),
+                action: "usage".into(),
+                sid: "s1".into(),
+                dur_ms: Some(1500),
+                bytes_down: 4000,
+                usage: Some(usage("claude-sonnet-5", 100, 40, 0, 0.0009)),
+                req_seq: Some(0),
+                ..Default::default()
+            },
+            "2026-06-05T10:00:02.000Z".into(),
+        )
+        .unwrap();
+        let report = query(&wide()).unwrap();
+        let t = &report.totals;
+        assert_eq!(t.requests, 1, "streamed warn must count once");
+        assert_eq!(t.warns, 1, "and stay in the warn category");
+        assert_eq!(t.allows, 0);
+        assert_eq!(t.no_usage_requests, 0);
+        assert_eq!(t.tokens.output, 40);
+        let m = &report.by_model;
+        assert_eq!(m.len(), 1, "moved to its model row: {m:?}");
+        assert_eq!(m[0].stats.warns, 1);
     }
 
     #[test]
@@ -1449,6 +1616,51 @@ mod tests {
             .unwrap()
             .contains("truncated"));
         assert_eq!(report.totals.requests, 2, "prefix still reported");
+    }
+
+    #[test]
+    fn query_never_false_alarms_during_appends() {
+        let (_g, _dir) = setup();
+        let mut a = Auditor::open().unwrap();
+        a.append(
+            Entry {
+                host: "seed".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                ..Default::default()
+            },
+            "2026-06-05T10:00:00.000Z".into(),
+        )
+        .unwrap();
+
+        // A live proxy keeps appending while `decoyrail stats` runs. The
+        // anchor is snapshotted before the log is read; sampling it after
+        // would let an append land in between, and the fresher anchor would
+        // present the healthy log as truncated.
+        let writer = std::thread::spawn(move || {
+            for i in 1..=200 {
+                a.append(
+                    Entry {
+                        host: format!("h{i}"),
+                        action: "allow".into(),
+                        sid: "s1".into(),
+                        ..Default::default()
+                    },
+                    "2026-06-05T10:00:01.000Z".into(),
+                )
+                .unwrap();
+            }
+        });
+        while !writer.is_finished() {
+            let report = query(&wide()).unwrap();
+            assert!(
+                report.integrity.ok,
+                "stats raced a concurrent append: {:?}",
+                report.integrity.detail
+            );
+        }
+        writer.join().unwrap();
+        assert_eq!(query(&wide()).unwrap().totals.requests, 201);
     }
 
     #[test]

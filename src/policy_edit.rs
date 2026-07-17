@@ -195,8 +195,8 @@ impl PolicyDoc {
 
     pub fn set_escalate_fallback(&mut self, action: &str) -> Result<()> {
         let a = Action::parse(action)?;
-        if !matches!(a, Action::Allow | Action::Deny) {
-            bail!("the escalate fallback must be allow or deny, not escalate");
+        if !matches!(a, Action::Allow | Action::Deny | Action::Warn) {
+            bail!("the escalate fallback must be allow, deny, or warn, not escalate");
         }
         self.doc["escalate_fallback"] = value(a.as_str());
         Ok(())
@@ -534,6 +534,24 @@ mod tests {
         assert!(doc.set_escalate_fallback("escalate").is_err());
         doc.set_escalate_fallback("allow").unwrap();
         assert_eq!(reparse(&doc).escalate_fallback, Action::Allow);
+        // Warn round-trips through both knobs (plan 017: persisting the watch
+        // posture needs no new surface).
+        doc.set_default("warn").unwrap();
+        assert_eq!(reparse(&doc).default_action, Action::Warn);
+        doc.set_escalate_fallback("warn").unwrap();
+        assert_eq!(reparse(&doc).escalate_fallback, Action::Warn);
+    }
+
+    #[test]
+    fn add_rule_with_warn_action() {
+        let mut doc = PolicyDoc::parse(DEFAULT_POLICY_TOML).unwrap();
+        doc.add(&edit("watched", "api.example.com", "warn"), &Anchor::End)
+            .unwrap();
+        let p = reparse(&doc);
+        assert_eq!(
+            p.evaluate("api.example.com", "/", "POST").action,
+            Action::Warn
+        );
     }
 
     #[test]

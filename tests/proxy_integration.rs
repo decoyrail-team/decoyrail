@@ -1044,4 +1044,179 @@ async fn proxy_end_to_end() {
         before + 123,
         "usage must be parsed from a buffered body that is really SSE"
     );
+
+    // --- Plan 017: the warn action. A warn default forwards unmatched
+    //     traffic with a distinct audit event; every override (tripwire, DLP
+    //     block, budget, named deny/escalate rules) keeps its precedence, and
+    //     no secret is ever released by warn.
+    let set_policy = |text: &str, bump: u64| {
+        let path = home.path().join("policy.toml");
+        std::fs::write(&path, text).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(bump))
+            .unwrap();
+    };
+    let warn_policy = "default_action = \"warn\"\nescalate_fallback = \"deny\"\n\
+         [[rule]]\nname = \"no-sink\"\nhosts = [\"localhost\"]\n\
+         path_prefixes = [\"/sink\"]\naction = \"deny\"\n\
+         [[rule]]\nname = \"second-look\"\nhosts = [\"localhost\"]\n\
+         path_prefixes = [\"/redirect\"]\naction = \"escalate\"\n\
+         [[rule]]\nname = \"watched-echo\"\nhosts = [\"localhost\"]\n\
+         path_prefixes = [\"/echo\"]\naction = \"warn\"\nallow_secrets = [\"svc\"]\n";
+    set_policy(warn_policy, 30);
+
+    // 28. WARN FORWARD: no rule matches /v1/fanout, so the warn default
+    //     applies — the request forwards, the response reaches the client,
+    //     and the audit log records a `warn` event on rule `default`.
+    let resp = client
+        .post(format!("{base}/v1/fanout"))
+        .header("content-type", "application/json")
+        .body(r#"{"probe":true}"#)
+        .send()
+        .await
+        .expect("warn forward request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "warn must forward the request"
+    );
+    let log = std::fs::read_to_string(&audit_path).unwrap();
+    let warn_line = log
+        .lines()
+        .find(|l| l.contains("\"action\":\"warn\""))
+        .expect("a warn event must be recorded");
+    assert!(
+        warn_line.contains("\"rule\":\"default\""),
+        "the warn event names the rule: {warn_line}"
+    );
+
+    // 29. WARN + TRIPWIRE: watch mode does not weaken the honeytoken alarm.
+    //     The honey decoy toward a warn-resolved destination still blocks.
+    let resp = client
+        .post(format!("{base}/v1/fanout"))
+        .header("x-honey", &honey_decoy)
+        .send()
+        .await
+        .expect("warn tripwire request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an unexpected decoy under warn must still tripwire"
+    );
+
+    // 30. WARN NEVER RELEASES: a warn rule listing the secret forwards the
+    //     request with the decoy still in place — no swap, no alarm.
+    let body = client
+        .get(format!("{base}/echo"))
+        .header("x-secret", &decoy)
+        .send()
+        .await
+        .expect("warn no-release request")
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(&decoy),
+        "the destination must receive the decoy, not the real value; got {body}"
+    );
+    assert!(
+        !body.contains(REAL),
+        "warn must never release the real secret"
+    );
+
+    // 31. NAMED RULES STILL WIN: the deny carve-out and the escalate rule
+    //     block exactly as they do under default deny.
+    let resp = client
+        .post(format!("{base}/sink"))
+        .body("x")
+        .send()
+        .await
+        .expect("deny-under-warn request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a named deny rule must win over the warn default"
+    );
+    let resp = client
+        .get(format!("{base}/redirect"))
+        .send()
+        .await
+        .expect("escalate-under-warn request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an escalate rule must still fall back to deny in watch mode"
+    );
+
+    // 32. DLP BLOCK OVERRIDES WARN: a blocking detector hit denies a request
+    //     that would otherwise ride the warn default.
+    set_policy(&format!("{warn_policy}[dlp]\npan = \"block\"\n"), 32);
+    let resp = client
+        .post(format!("{base}/echo-body"))
+        .header("content-type", "application/json")
+        .body(format!("{{\"card_number\":\"{PAN}\"}}"))
+        .send()
+        .await
+        .expect("dlp-under-warn request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a DLP block must override a warn resolution"
+    );
+
+    // 33. BUDGET OVERRIDES WARN: an exhausted budget denies warn traffic too.
+    decoyrail::meter::save_budget(0.0001).unwrap();
+    {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.path().join("budget.json"))
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(34))
+            .unwrap();
+    }
+    let resp = client
+        .post(format!("{base}/echo-body"))
+        .body("over budget probe")
+        .send()
+        .await
+        .expect("budget-under-warn request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an exhausted budget must override a warn resolution"
+    );
+    let log = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        log.contains("budget exhausted"),
+        "the deny must be attributed to the budget"
+    );
+
+    // 34. The audit chain verifies across the warn events, and stats count
+    //     them as their own category with per-host detail.
+    assert!(
+        decoyrail::audit::verify().is_ok(),
+        "audit chain must verify across warn events"
+    );
+    {
+        use decoyrail::stats::{self, Window};
+        let report = stats::query(&Window::All).unwrap();
+        // Scenarios 28 and 30 forwarded under warn; everything else blocked.
+        assert_eq!(report.totals.warns, 2, "warns count in their own category");
+        let host = report
+            .by_host
+            .iter()
+            .find(|h| h.name == "localhost")
+            .expect("localhost row");
+        assert_eq!(
+            host.stats.warns, 2,
+            "the per-host breakdown says who rides the warn default"
+        );
+        assert!(
+            report.totals.denies.budget >= 1,
+            "the budget deny is classified"
+        );
+    }
 }

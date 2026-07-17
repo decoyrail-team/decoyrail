@@ -133,7 +133,7 @@ flowchart TD
     reload --> pol{"policy rules<br/>(first match wins)"}
     pol -->|no match| defact["default_action (deny)"]
     pol -->|escalate| esc["escalate_fallback (deny)<br/>marked 'escalated' in audit"]
-    pol -->|allow / deny| act[decision]
+    pol -->|allow / warn / deny| act[decision]
     defact --> act
     esc --> act
 
@@ -150,7 +150,7 @@ flowchart TD
     budget -->|yes| deny
     budget -->|no| final{decision}
     final -->|deny| deny
-    final -->|allow| fwd["forward upstream<br/>(real TLS, no redirects)"]
+    final -->|"allow, or warn<br/>(forwarded + warn event,<br/>no secret released)"| fwd["forward upstream<br/>(real TLS, no redirects)"]
 
     deny --> audit["audit event<br/>(hash-chained JSONL)"]
     r413 --> audit
@@ -159,8 +159,8 @@ flowchart TD
 
 Three overrides are absolute: a tripwire, a blocking DLP detector
 hit ([sensitive-data filtering](dlp.md)), or an exhausted budget denies
-even when policy said allow. In the tripwire case the real secret was never
-substituted in, so nothing sensitive was staged for sending.
+even when policy said allow or warn. In the tripwire case the real secret
+was never substituted in, so nothing sensitive was staged for sending.
 
 Denials return a JSON body the agent can understand:
 
@@ -185,7 +185,7 @@ flowchart TD
     where -->|"literal, in a header or the body"| listed{"winning policy rule<br/>lists the secret<br/>in allow_secrets?"}
 
     listed -->|no| tw
-    listed -->|"yes, but the rule<br/>blocks (deny/escalate)"| quiet["no swap, no alarm<br/>the request is already blocked;<br/>an expected credential riding it<br/>is not an exfil signal"]
+    listed -->|"yes, but the rule<br/>doesn't release<br/>(deny / escalate / warn)"| quiet["no swap, no alarm<br/>an expected credential is not<br/>an exfil signal (deny/escalate<br/>block; warn forwards the decoy)"]
     listed -->|"yes, and the rule allows"| tls{"transport is TLS?"}
     tls -->|"no (plain HTTP)"| tw2["TRIPWIRE<br/>real secrets never ride in the clear"]
     tls -->|yes| loc{"found in the secret's location?<br/>(bearer / named header / body)"}
@@ -217,6 +217,7 @@ The corner cases:
   default policy's telemetry and gist carve-outs list the provider label,
   so the agent's own credential riding those blocked calls doesn't page
   anyone. The request is still denied and audited.
+- **A secret listed on a warn rule forwards quietly, as the decoy.** The [warn action](policy.md#warn-forward-but-say-so) never releases anything; the destination receives the decoy and the request is audited as a warn event.
 
 ## Response handling: stream fast, scan what's bounded
 
