@@ -35,7 +35,7 @@ doing and why something was denied.
 
 | Field | Meaning |
 |---|---|
-| `action` | `allow`, `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
+| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
 | `rule` | the policy rule that decided it (`default` when nothing matched) |
 | `escalated` | the matching rule said `escalate` (resolved via fallback) |
 | `swaps` | secrets substituted, as `name@location` |
@@ -47,7 +47,7 @@ doing and why something was denied.
 | `dur_ms` | request duration in milliseconds; on streamed responses it moves to the companion `usage` event so nothing is measured twice |
 | `bytes_up`, `bytes_down` | request and response sizes as seen at the proxy (omitted when zero) |
 | `usage` | structured token counts and cost for LLM requests: `{model, input, output, cache_read, cache_write, cost_usd}` |
-| `req_seq` | on `usage` events: the `seq` of the allow event the counts belong to |
+| `req_seq` | on `usage` events: the `seq` of the allow or warn event the counts belong to |
 
 The analytics fields (`sid` through `req_seq`) exist so `decoyrail stats`
 can aggregate the log without parsing prose; see [Analytics](stats.md). Like

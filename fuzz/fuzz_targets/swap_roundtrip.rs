@@ -1,9 +1,9 @@
 #![no_main]
 //! Fuzz the decoy<->real swap engine with the core security invariant as an
 //! assert: a real secret appears in the outbound request only when the
-//! winning decision releases it AND the transport is TLS. Everything else
-//! (deny, no release, plaintext) must leave the bytes free of every real
-//! value, whatever the surrounding input looks like.
+//! winning decision is allow, releases it, AND the transport is TLS.
+//! Everything else (deny, warn, no release, plaintext) must leave the bytes
+//! free of every real value, whatever the surrounding input looks like.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -19,7 +19,9 @@ struct Input {
     splice_at: u16,
     release: bool,
     tls: bool,
-    deny: bool,
+    /// Winning action, modulo the actions the pipeline can hand the swap
+    /// engine (escalate resolves before the swap runs).
+    action: u8,
 }
 
 fn secret(name: &str, real: &str, location: Location) -> Secret {
@@ -67,12 +69,13 @@ fuzz_target!(|input: Input| {
         }
     }
 
+    let action = match input.action % 3 {
+        0 => Action::Allow,
+        1 => Action::Deny,
+        _ => Action::Warn,
+    };
     let decision = Decision {
-        action: if input.deny {
-            Action::Deny
-        } else {
-            Action::Allow
-        },
+        action,
         rule: "fuzz".into(),
         escalated: false,
         allow_secrets: if input.release {
@@ -120,8 +123,9 @@ fuzz_target!(|input: Input| {
     }
 
     // The invariant: without (release AND allow AND TLS), no real value may
-    // exist anywhere in the request the proxy would forward.
-    let released = input.release && !input.deny && input.tls;
+    // exist anywhere in the request the proxy would forward. Warn forwards
+    // like allow but sits on the unreleased side, always.
+    let released = input.release && action == Action::Allow && input.tls;
     if !released {
         for s in &vault.secrets {
             assert!(

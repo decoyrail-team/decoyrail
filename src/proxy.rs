@@ -410,6 +410,10 @@ async fn pipeline_inner(
 
     // 5. Final action. A tripwire, a DLP block, or a blown budget overrides
     //    policy → deny, and critically we have NOT forwarded any real secret.
+    //    These overrides take the same precedence over warn as over allow; a
+    //    warn that survives them forwards below exactly like an allow (the
+    //    swap released nothing, so only decoys ride it) and is audited as a
+    //    distinct `warn` event.
     let (final_action, note) = if outcome.tripped() {
         let mut msg = format!("tripwire: {}", outcome.tripwires[0].message(host));
         if outcome.tripwires.len() > 1 {
@@ -720,7 +724,9 @@ async fn pipeline_inner(
             host: host.into(),
             path,
             method,
-            action: "allow".into(),
+            // "allow", or "warn" for a forwarded-with-alert resolution (the
+            // deny branch returned above; escalate never leaves resolution).
+            action: final_action.as_str().into(),
             rule: decision.rule,
             escalated: decision.escalated,
             swaps: swap_names,

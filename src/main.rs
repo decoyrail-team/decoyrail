@@ -92,6 +92,13 @@ struct RunArgs {
     /// Disable automatic env-var decoying. Vault entries still inject decoys.
     #[arg(long)]
     pass_all_env: bool,
+    /// Watch mode: for this session, destinations no rule matches are
+    /// forwarded and recorded as warn events instead of blocked. The policy
+    /// file is untouched; deny/escalate rules still block, and no secret is
+    /// ever released by warn. The tuning posture: watch `decoyrail log -t`,
+    /// add rules, return to deny.
+    #[arg(long)]
+    watch: bool,
     /// The command and arguments to run, after `--`.
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
@@ -213,7 +220,7 @@ struct PolicyAddArgs {
     /// Restrict to these path prefixes (repeatable; default any).
     #[arg(long = "path-prefix", value_name = "PREFIX")]
     path_prefixes: Vec<String>,
-    /// allow | deny | escalate.
+    /// allow | deny | warn | escalate.
     #[arg(long, default_value = "allow")]
     action: String,
     /// Secret to release here: a vault name or provider:<label> (repeatable).
@@ -252,7 +259,7 @@ struct PolicySetArgs {
     /// Clear the path-prefix restriction (match any path).
     #[arg(long)]
     clear_path_prefixes: bool,
-    /// Change the action (allow | deny | escalate).
+    /// Change the action (allow | deny | warn | escalate).
     #[arg(long)]
     action: Option<String>,
     /// Replace the released-secret list (repeatable).
@@ -288,9 +295,10 @@ struct PolicyMvArgs {
 
 #[derive(Args)]
 struct PolicyDefaultArgs {
-    /// allow | deny | escalate.
+    /// allow | deny | warn | escalate.
     action: String,
-    /// Set the escalate fallback (allow | deny) instead of the default action.
+    /// Set the escalate fallback (allow | deny | warn) instead of the default
+    /// action.
     #[arg(long)]
     fallback: bool,
 }
@@ -444,6 +452,10 @@ fn run_command(args: RunArgs) -> Result<()> {
 
         engine.set_session_secrets(env_secrets.clone());
 
+        if args.watch {
+            engine.set_default_action_override(policy::Action::Warn);
+        }
+
         // Label this session in the audit log with the command it launches,
         // so `decoyrail stats --by session` can say what each session was.
         engine.announce_session(&args.cmd.join(" ")).await?;
@@ -491,6 +503,18 @@ fn run_command(args: RunArgs) -> Result<()> {
         {
             let policy = engine.policy.read().await;
             report_session_decoys(&policy, &env_secrets);
+        }
+
+        if args.watch {
+            eprintln!(
+                "decoyrail: WATCH MODE for this session: destinations no rule matches are \
+                 FORWARDED and logged as warn events, not blocked."
+            );
+            eprintln!(
+                "decoyrail: deny and escalate rules still block, and warn never releases a \
+                 secret. Watch unknown egress with `decoyrail log -t`, add the rules you \
+                 decide on, then run without --watch to return to deny."
+            );
         }
 
         eprintln!(
@@ -1025,6 +1049,14 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
                 doc.set_default(&a.action)?;
                 doc.save()?;
                 println!("Default action set to {}.", a.action.to_lowercase());
+                if matches!(policy::Action::parse(&a.action), Ok(policy::Action::Warn)) {
+                    println!(
+                        "Unmatched destinations are now forwarded and recorded as warn \
+                         events, not blocked. Watch them with `decoyrail log -t`; for a \
+                         single session, `decoyrail run --watch` does this without \
+                         editing the policy."
+                    );
+                }
             }
             after_policy_mutation()?;
         }
@@ -1586,6 +1618,8 @@ fn print_audit_line(line: &str) {
         "[TRIP]"
     } else if ev.action == "deny" {
         "[DENY]"
+    } else if ev.action == "warn" {
+        "[WARN]"
     } else if ev.action == "alert" {
         "[ALRT]"
     } else {

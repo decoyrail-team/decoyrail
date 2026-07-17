@@ -287,6 +287,16 @@ email = "off"
 
 Or from the CLI: `decoyrail dlp show` and `decoyrail dlp set pan block`.
 
+### Tuning without breaking the agent: watch mode
+
+Default-deny means an agent hitting one unlisted host stops until you add a rule. When you are still figuring out which hosts a workflow needs, run a session in watch mode:
+
+```sh
+decoyrail run --watch -- claude
+```
+
+For that session only, destinations no rule matches are forwarded and recorded as `[WARN]` events instead of blocked. The policy file is untouched, deny and escalate rules still block, and no secret is ever released by a warn (a decoy heading somewhere unexpected still trips the alarm). Keep `decoyrail log -t` open, note which hosts ride the warn default (`decoyrail stats --by host` counts them), add the allow or deny rules you decide on, then run without `--watch` to return to deny. Warn mode records unknown egress rather than blocking it, so treat it as a tuning step, not a resting state; the [policy reference](policy.md#warn-forward-but-say-so) and [threat model](threat-model.md#warn-mode-records-it-does-not-block) spell out the tradeoff. To make the posture permanent anyway, `decoyrail policy default warn` does the same thing in the file.
+
 ## 7. Point other apps at Decoyrail (standalone proxy)
 
 `decoyrail run` is the easiest path, but you can also run the proxy as a
@@ -404,7 +414,7 @@ those, only policy allow/deny applies (no body inspection).
 **Everything is denied.** That's the default-deny posture working. Run
 `decoyrail log -t` in a second terminal while the agent works to see exactly
 which hosts are being denied, then add allow rules for the legitimate ones
-(`decoyrail policy path`), or start from the shipped default pack.
+(`decoyrail policy path`), or start from the shipped default pack. If the blocking makes tuning painful, `decoyrail run --watch` forwards unmatched hosts for one session and records them as `[WARN]` events, so you can write the rules from real traffic; see [watch mode](#tuning-without-breaking-the-agent-watch-mode).
 
 **A legitimate request tripped the tripwire.** The secret reached a
 destination no policy rule releases it to. Add the destination to the

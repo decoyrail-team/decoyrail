@@ -10,10 +10,16 @@
 //! provider label as `provider:github`) that are *expected* at destinations
 //! the rule matches. On a rule that resolves to allow, an expected secret's
 //! decoy is swapped for the real value. On any other rule, an expected
-//! secret's decoy blocks quietly with the request instead of sounding the
-//! honeytoken alarm (the agent's own credential riding a denied telemetry
-//! call is not an exfil signal). A decoy the winning rule does not expect is
-//! always a tripwire.
+//! secret's decoy stays quiet instead of sounding the honeytoken alarm (the
+//! agent's own credential riding a denied telemetry call is not an exfil
+//! signal): deny and escalate block the request, warn forwards it with the
+//! decoy still in place. A decoy the winning rule does not expect is always
+//! a tripwire.
+//!
+//! `warn` is the watch-mode action (plan 017): the request forwards exactly
+//! like allow, but the audit log records it as a distinct `warn` event and no
+//! secret is ever released — the only protection it trades away is the
+//! blocking of traffic that carries no secret.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -26,6 +32,10 @@ use crate::vault::{glob_match, Secret, PROVIDER_LABELS};
 pub enum Action {
     Allow,
     Deny,
+    /// Forward like allow but record a visible alert — and never release a
+    /// secret. The middle posture between "deny what I haven't listed" and
+    /// running unprotected; see plans/017.
+    Warn,
     /// Defer to judge/human. Resolves to `escalate_fallback` until v0.5.
     Escalate,
 }
@@ -36,6 +46,7 @@ impl Action {
         match self {
             Action::Allow => "allow",
             Action::Deny => "deny",
+            Action::Warn => "warn",
             Action::Escalate => "escalate",
         }
     }
@@ -45,9 +56,10 @@ impl Action {
         match s.to_ascii_lowercase().as_str() {
             "allow" => Ok(Action::Allow),
             "deny" => Ok(Action::Deny),
+            "warn" => Ok(Action::Warn),
             "escalate" => Ok(Action::Escalate),
             other => Err(anyhow::anyhow!(
-                "unknown action '{other}' (use allow|deny|escalate)"
+                "unknown action '{other}' (use allow|deny|warn|escalate)"
             )),
         }
     }
@@ -231,13 +243,15 @@ pub struct Decision {
 
 impl Decision {
     /// The winning rule releases this secret: swap decoy for real (transport
-    /// and location checks still apply).
+    /// and location checks still apply). Only allow releases — a warn rule
+    /// forwards, but its listed secrets stay decoys.
     pub fn releases(&self, secret: &Secret) -> bool {
         self.action == Action::Allow && lists_secret(&self.allow_secrets, secret)
     }
 
-    /// The winning rule expects this secret here even though the request is
-    /// blocked: no swap, but no honeytoken alarm either.
+    /// The winning rule expects this secret here even though it is not
+    /// released (blocked, or forwarded under warn): no swap, but no
+    /// honeytoken alarm either.
     pub fn expects(&self, secret: &Secret) -> bool {
         lists_secret(&self.allow_secrets, secret)
     }
@@ -268,7 +282,12 @@ impl Policy {
     fn resolve(&self, action: Action, rule: String, allow_secrets: Vec<String>) -> Decision {
         match action {
             Action::Escalate => Decision {
-                action: self.escalate_fallback,
+                // A hand-edited fallback of "escalate" would otherwise resolve
+                // to an action the pipeline forwards; fail closed instead.
+                action: match self.escalate_fallback {
+                    Action::Escalate => Action::Deny,
+                    other => other,
+                },
                 rule,
                 escalated: true,
                 allow_secrets,
@@ -366,6 +385,11 @@ pub const DEFAULT_POLICY_TOML: &str = r#"# Decoyrail default policy: "Claude Cod
 # auto-decoyed session secrets and vault entries with a recognized format).
 # On an allow rule the decoy is swapped for the real value; on a deny or
 # escalate rule the request blocks without raising the honeytoken alarm.
+#
+# Actions: allow | deny | warn | escalate. "warn" forwards like allow but
+# records a distinct warn event and never releases a secret; set it as the
+# default (or run `decoyrail run --watch`) to tune the policy against real
+# traffic without blocking the agent first.
 default_action = "deny"
 escalate_fallback = "deny"
 
@@ -819,6 +843,114 @@ debug = true
         assert!(!p.cache.repair);
         assert!(!p.cache.keep_alive);
         assert!(!p.cache.serialize_fanout);
+    }
+
+    #[test]
+    fn warn_parses_everywhere_an_action_is_accepted() {
+        assert_eq!(Action::parse("warn").unwrap(), Action::Warn);
+        assert_eq!(Action::parse("WARN").unwrap(), Action::Warn);
+        assert_eq!(Action::Warn.as_str(), "warn");
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "warn"
+escalate_fallback = "warn"
+[[rule]]
+name = "watched"
+hosts = ["api.example.com"]
+action = "warn"
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.default_action, Action::Warn);
+        assert_eq!(p.escalate_fallback, Action::Warn);
+        assert_eq!(p.rules[0].action, Action::Warn);
+    }
+
+    #[test]
+    fn warn_default_forwards_unmatched_named_rules_still_win() {
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "warn"
+[[rule]]
+name = "blocked"
+hosts = ["evil.example.com"]
+action = "deny"
+[[rule]]
+name = "second-look"
+hosts = ["pastebin.example.com"]
+action = "escalate"
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("unknown.example.com", "/", "POST");
+        assert_eq!(d.action, Action::Warn);
+        assert_eq!(d.rule, "default");
+        // Named deny and escalate rules keep winning over the warn default.
+        assert_eq!(
+            p.evaluate("evil.example.com", "/", "POST").action,
+            Action::Deny
+        );
+        let d = p.evaluate("pastebin.example.com", "/", "POST");
+        assert!(d.escalated);
+        assert_eq!(d.action, Action::Deny);
+    }
+
+    #[test]
+    fn warn_never_releases_but_expects_listed_secrets() {
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "watched"
+hosts = ["api.example.com"]
+action = "warn"
+allow_secrets = ["svc"]
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/v1/x", "POST");
+        assert_eq!(d.action, Action::Warn);
+        assert!(!d.releases(&secret("svc", None)), "warn must never swap");
+        assert!(d.expects(&secret("svc", None)), "but no honeytoken alarm");
+        assert!(!d.expects(&secret("other", None)));
+    }
+
+    #[test]
+    fn escalate_resolves_through_warn_fallback() {
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+escalate_fallback = "warn"
+[[rule]]
+name = "second-look"
+hosts = ["pastebin.example.com"]
+action = "escalate"
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("pastebin.example.com", "/", "POST");
+        assert_eq!(d.action, Action::Warn);
+        assert!(d.escalated, "the event still records the escalation");
+    }
+
+    #[test]
+    fn escalate_fallback_of_escalate_fails_closed() {
+        // A hand-edited fallback of "escalate" must not resolve to an action
+        // the pipeline would forward.
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+escalate_fallback = "escalate"
+[[rule]]
+name = "loop"
+hosts = ["api.example.com"]
+action = "escalate"
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/", "POST");
+        assert_eq!(d.action, Action::Deny);
+        assert!(d.escalated);
     }
 
     #[test]

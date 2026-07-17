@@ -138,6 +138,10 @@ an adversary with full local access.
   the intended posture; use `--pass-env DATABASE_URL` if you accept the
   exposure instead.
 
+### Warn mode records, it does not block
+
+The `warn` action (and `decoyrail run --watch`, which makes it the default for one session) forwards requests to hosts no rule matches instead of denying them. In that posture, exfiltration of non-secret data (source code, prompts, file contents) to an unlisted host is not prevented; it is recorded as a `warn` audit event. The secret guarantees are unchanged: warn never releases a real secret, an unexpected decoy still trips the alarm and blocks, and DLP blocks and budget stops still win. The shipped default stays deny; warn is a posture you choose explicitly, meant for tuning a policy (watch the log, add rules, return to deny), not for living in. `decoyrail stats` counts warn traffic per host so you can see how much is riding the default.
+
 ### Encoding/obfuscation beyond the scanned forms
 
 The tripwire scans for the literal decoy plus its base64 (padded and
@@ -189,13 +193,6 @@ on, and the ones to check a change against:
    whose winning policy rule releases them.
 2. The upstream client never follows redirects and never honors proxy env
    vars.
-3. Fail closed: unmatched destinations deny; `escalate` resolves to deny
-   until a judge exists; tripwire, DLP block, and budget exhaustion override
-   an allow.
-4. A decoy is never swapped when anything about the context is anomalous:
-   no releasing rule, wrong header, in the URL, encoded form, plaintext
-   transport. Anomalous means tripwire, with one deliberate exception: a
-   secret the winning rule lists but blocks (a deny/escalate carve-out) is
-   denied quietly, because the agent's own credential riding a blocked
-   request is expected traffic, not exfiltration.
+3. Fail closed: unmatched destinations deny unless the operator explicitly chose warn; `escalate` resolves to deny until a judge exists; tripwire, DLP block, and budget exhaustion override an allow or a warn.
+4. A decoy is never swapped when anything about the context is anomalous: no releasing rule, wrong header, in the URL, encoded form, plaintext transport. Anomalous means tripwire, with one deliberate exception: a secret the winning rule lists but does not release (a deny/escalate carve-out, or a warn rule) stays quiet, because the agent's own credential riding that request is expected traffic, not exfiltration. Warn forwards but sits on the unreleased side of this line, always.
 5. Every decision produces an audit event that chains to the one before it.

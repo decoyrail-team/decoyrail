@@ -64,6 +64,11 @@ pub struct Engine {
     /// Gates paid conveniences only — the pipeline's security verbs never
     /// read it, so no license state can block traffic or weaken enforcement.
     pub license: Arc<RwLock<Option<LicenseDoc>>>,
+    /// Session override of the policy's default action (`decoyrail run
+    /// --watch` pins it to warn). Never persisted, and reapplied after every
+    /// policy hot-reload so a file edit mid-session cannot displace the
+    /// operator's explicit choice. Named rules still win over the default.
+    default_override: Option<crate::policy::Action>,
     reload: Arc<Mutex<ReloadState>>,
 }
 
@@ -179,6 +184,7 @@ impl Engine {
             keepalive: Arc::new(Mutex::new(crate::cache::KeepAlive::default())),
             session_id: new_session_id(),
             license: Arc::new(RwLock::new(license_doc)),
+            default_override: None,
             reload,
         })
     }
@@ -216,6 +222,18 @@ impl Engine {
         self.session = Arc::new(Vault { secrets });
     }
 
+    /// Pin the policy's default action for this session (`decoyrail run
+    /// --watch`). The policy file is untouched; `refresh` reapplies the
+    /// override after every reload. Call before the engine is cloned into
+    /// the serve task, like `set_session_secrets`.
+    pub fn set_default_action_override(&mut self, action: crate::policy::Action) {
+        self.default_override = Some(action);
+        // try_write never fails here: the serve task doesn't exist yet.
+        if let Ok(mut p) = self.policy.try_write() {
+            p.default_action = action;
+        }
+    }
+
     /// Reload vault, policy, and budget from disk if their files changed since
     /// last seen, so `decoyrail vault add`, a policy edit, or `decoyrail budget` take
     /// effect on a running proxy without a restart. Called once per request;
@@ -238,7 +256,12 @@ impl Engine {
             if now != st.policy {
                 st.policy = now;
                 match Policy::load_or_default() {
-                    Ok(p) => {
+                    Ok(mut p) => {
+                        // The operator's session override outlives file edits;
+                        // rules change as usual, the default stays pinned.
+                        if let Some(a) = self.default_override {
+                            p.default_action = a;
+                        }
                         // Reload-time sanity: allow_secrets entries that can't
                         // match, or releasing rules a broader rule shadows,
                         // silently turn a working credential into a tripwire.
@@ -418,6 +441,76 @@ mod tests {
         assert!(log.contains("license file rejected"));
 
         std::env::remove_var("DECOYRAIL_LICENSE_EXTRA_KEY");
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
+
+    /// Watch mode (plan 017): the session override pins the default action to
+    /// warn, a policy hot-reload keeps the pin while its rule changes land,
+    /// and the policy file itself is never modified.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn watch_mode_override_survives_policy_reload() {
+        use crate::policy::Action;
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+
+        let path = config::policy_path().unwrap();
+        std::fs::write(&path, "default_action = \"deny\"\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut engine = Engine::boot().unwrap();
+        engine.set_default_action_override(Action::Warn);
+        {
+            let p = engine.policy.read().await;
+            assert_eq!(
+                p.evaluate("unknown.example.com", "/", "GET").action,
+                Action::Warn
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "policy file untouched"
+        );
+
+        // A mid-session policy edit lands its rules but cannot displace the
+        // operator's explicit override.
+        std::fs::write(
+            &path,
+            "default_action = \"deny\"\n\
+             [[rule]]\nname = \"blocked\"\nhosts = [\"evil.example.com\"]\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        engine.refresh().await;
+        {
+            let p = engine.policy.read().await;
+            assert_eq!(
+                p.evaluate("evil.example.com", "/", "GET").action,
+                Action::Deny,
+                "the reloaded deny rule still wins over the default"
+            );
+            assert_eq!(
+                p.evaluate("unknown.example.com", "/", "GET").action,
+                Action::Warn,
+                "the reload must not displace the override"
+            );
+        }
+
+        // A fresh engine without the flag is back to the file's posture.
+        let engine = Engine::boot().unwrap();
+        let p = engine.policy.read().await;
+        assert_eq!(
+            p.evaluate("unknown.example.com", "/", "GET").action,
+            Action::Deny
+        );
+
         std::env::remove_var("DECOYRAIL_HOME");
     }
 }

@@ -24,7 +24,7 @@ name = "anthropic"                     # label; shows up in `decoyrail log`
 hosts = ["api.anthropic.com"]          # required; glob per entry
 methods = ["POST"]                     # optional; empty = any method
 path_prefixes = ["/v1"]                # optional; empty = any path
-action = "allow"                       # allow | deny | escalate
+action = "allow"                       # allow | deny | warn | escalate
 allow_secrets = ["anthropic"]          # optional; secrets released here
 
 [dlp]                                  # sensitive-data detectors
@@ -50,7 +50,7 @@ flowchart TD
 
     a1 & a2 & def --> esc{action is escalate?}
     esc -->|yes| fb["resolve to escalate_fallback (deny)<br/>event marked escalated=true in audit"]
-    esc -->|no| done[allow / deny]
+    esc -->|no| done[allow / warn / deny]
     fb --> done
 ```
 
@@ -117,13 +117,7 @@ two ways:
   secrets `decoyrail run` auto-decoys from your environment. Labels:
   `anthropic`, `openai`, `github`, `gitlab`, `slack`, `npm`.
 
-What happens to a listed secret depends on the rule's action. On a rule
-that resolves to **allow**, the decoy is swapped for the real value (over
-TLS, in the [location](vault-and-bindings.md) the secret rides in). On a
-**deny** or **escalate** rule, the request blocks without swapping, and
-without raising the honeytoken alarm: your agent's own credential riding a
-denied telemetry call is expected, not an exfiltration signal. A decoy the
-winning rule does not list at all is always a tripwire.
+What happens to a listed secret depends on the rule's action. On a rule that resolves to **allow**, the decoy is swapped for the real value (over TLS, in the [location](vault-and-bindings.md) the secret rides in). On a **deny** or **escalate** rule, the request blocks without swapping, and without raising the honeytoken alarm: your agent's own credential riding a denied telemetry call is expected, not an exfiltration signal. On a **warn** rule, the request forwards with the decoy still in place, again without the alarm: only allow ever releases a secret. A decoy the winning rule does not list at all is always a tripwire.
 
 Because the winning rule decides everything, ordering buys you a useful
 posture: a scoped rule without `allow_secrets` above a broad rule with it
@@ -150,6 +144,14 @@ releasing rule silently turns the credential into a tripwire, because the
 releasing rule can never win. Decoyrail warns about that (and about
 `allow_secrets` entries that match nothing) when the policy loads and on
 `decoyrail policy show`. Warnings never block the load.
+
+## `warn`: forward, but say so
+
+`warn` forwards a request the way allow does, with two differences: the audit log records it as a distinct `warn` event (rendered `[WARN]` in `decoyrail log -t`, counted separately in `decoyrail stats`), and no secret is ever released. A warn rule that lists a secret in `allow_secrets` forwards the request with the decoy still in place, quietly; a decoy the rule does not list still trips the honeytoken alarm and blocks. The other overrides keep their precedence too: a blocking DLP hit or an exhausted budget denies a request that would otherwise ride a warn.
+
+Its main use is as the default action while you tune a policy. With `default_action = "warn"` (or, for one session, `decoyrail run --watch`, which pins the default to warn without touching the file), an agent hitting an unlisted host keeps working, and the log tells you exactly which hosts are riding the default so you can write the allow or deny rules you actually want. Named deny and escalate rules still block in this mode.
+
+Be honest with yourself about the tradeoff: warn does not block the exfiltration of non-secret data (source code, prompts) to unlisted hosts, it records it. The shipped default stays deny, and the [threat model](threat-model.md#warn-mode-records-it-does-not-block) spells this out. Treat warn as the tuning posture with an exit, not a place to live: watch the log, add rules, go back to deny.
 
 ## `escalate`: fails closed today, judge later
 
@@ -265,10 +267,10 @@ untouched and exits non-zero, so you can chain them safely in a shell script.
 Policy is necessary but not sufficient for a request to leave:
 
 - A **tripwire** (a decoy the winning rule does not list) denies even on an
-  allowed host.
+  allowed or warned host.
 - A blocking **[DLP detector](dlp.md) hit** (a card number, SSN, or bank
   identifier with the detector set to `block`) denies even on an allowed
-  host.
+  or warned host.
 - An **exhausted budget** denies everything until the month rolls over or
   the budget is raised.
 - An **allow** without `allow_secrets` does not swap anything: the host is
