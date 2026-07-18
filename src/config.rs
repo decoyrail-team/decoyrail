@@ -163,6 +163,12 @@ pub fn plan_path() -> Result<PathBuf> {
     Ok(home()?.join("plan.json"))
 }
 
+/// The spend tripwire's persisted trip state (plan 002). Absence is the
+/// defined clear state; `decoyrail trip clear` removes it, nothing expires it.
+pub fn trip_path() -> Result<PathBuf> {
+    Ok(home()?.join("trip.json"))
+}
+
 /// The installed license file (signed, offline; see `license.rs`). Absence is
 /// the defined Free state, so nothing creates this except `license install`.
 pub fn license_path() -> Result<PathBuf> {

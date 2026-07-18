@@ -2023,6 +2023,7 @@ mod tests {
                 bytes_down: 4000,
                 usage: Some(usage("claude-sonnet-5", 1000, 200, 3000, 0.0014)),
                 req_seq: None,
+                fp: None,
                 prev_hash: String::new(),
                 hash: String::new(),
             };

@@ -255,6 +255,53 @@ impl SoftLandingConfig {
     }
 }
 
+/// What a spend-tripwire trip does to subsequent LLM traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TripwireMode {
+    /// Deny LLM-bound requests until `decoyrail trip clear` (the default).
+    Block,
+    /// Record the trip and keep forwarding: visibility before enforcement.
+    Alert,
+    /// No detection at all.
+    Off,
+}
+
+/// Spend tripwire (plan 002): mechanical runaway detection — the same
+/// request repeated many times in a window, or a spend rate far above the
+/// session's own baseline. On by default with conservative thresholds; a
+/// safety feature, so it ships in the free tier and no license gates it.
+/// Mirrors `[spend_tripwire]` in the policy file, hot-reloaded like the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpendTripwireConfig {
+    pub mode: TripwireMode,
+    /// Identical requests inside the window that trip. 0 disables repeat
+    /// detection. The default is generous to polling patterns: fifteen
+    /// byte-identical LLM calls in five minutes is a loop, not a retry.
+    pub repeats: u32,
+    /// Sliding window, seconds, shared by both detectors.
+    pub window_secs: u64,
+    /// A window's spend rate must exceed the session baseline by this factor
+    /// to trip. 0 disables rate detection.
+    pub rate_multiplier: f64,
+    /// And exceed this many dollars inside the window, so a spiky-but-cheap
+    /// burst over a near-zero baseline never trips.
+    pub rate_floor_usd: f64,
+}
+
+impl Default for SpendTripwireConfig {
+    fn default() -> Self {
+        Self {
+            mode: TripwireMode::Block,
+            repeats: 15,
+            window_secs: 300,
+            rate_multiplier: 10.0,
+            rate_floor_usd: 5.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub default_action: Action,
@@ -268,6 +315,8 @@ pub struct Policy {
     pub cache: CacheConfig,
     #[serde(default)]
     pub soft_landing: SoftLandingConfig,
+    #[serde(default)]
+    pub spend_tripwire: SpendTripwireConfig,
 }
 
 fn default_escalate_fallback() -> Action {
@@ -699,6 +748,19 @@ email = "off"    # email addresses; off because commits and packages carry them
 # [soft_landing]
 # threshold_pct = 80
 # map = { "claude-opus-4" = "claude-sonnet-5" }
+
+# Spend tripwire (free). Catches runaway loops in minutes: the same request
+# repeated `repeats` times inside the window, or a spend rate far above the
+# session's own baseline, blocks LLM-bound traffic (non-LLM egress keeps
+# flowing) until `decoyrail trip clear`. On by default with the settings
+# below; uncomment to tune, or set mode = "alert" (record, don't block) or
+# "off".
+# [spend_tripwire]
+# mode = "block"
+# repeats = 15
+# window_secs = 300
+# rate_multiplier = 10.0
+# rate_floor_usd = 5.0
 "#;
 
 #[cfg(test)]
@@ -1065,6 +1127,40 @@ debug = true
             toml::from_str("default_action = \"deny\"\n[soft_landing]\nmap = { \"a\" = \"b\" }\n")
                 .unwrap();
         assert!(!p.soft_landing.enabled());
+    }
+
+    #[test]
+    fn spend_tripwire_defaults_on_and_parses_overrides() {
+        // Absent section (including every policy written before it existed):
+        // the conservative defaults, in block mode. A safety feature defaults
+        // on, unlike the paid conveniences above.
+        let p: Policy = toml::from_str("default_action = \"deny\"").unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Block);
+        assert_eq!(p.spend_tripwire.repeats, 15);
+        assert_eq!(p.spend_tripwire.window_secs, 300);
+        assert_eq!(p.spend_tripwire.rate_multiplier, 10.0);
+        assert_eq!(p.spend_tripwire.rate_floor_usd, 5.0);
+
+        // A partial table overrides just what it names.
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[spend_tripwire]\nmode = \"alert\"\nrepeats = 30\n",
+        )
+        .unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Alert);
+        assert_eq!(p.spend_tripwire.repeats, 30);
+        assert_eq!(
+            p.spend_tripwire.window_secs, 300,
+            "unnamed fields keep defaults"
+        );
+
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[spend_tripwire]\nmode = \"off\"\n")
+                .unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Off);
+
+        // The shipped default policy parses with the commented table intact.
+        let p: Policy = toml::from_str(DEFAULT_POLICY_TOML).unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Block);
     }
 
     #[test]

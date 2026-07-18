@@ -24,6 +24,7 @@ pub mod stats;
 pub mod swap;
 pub mod util;
 pub mod vault;
+pub mod watch;
 
 /// Install the process-wide rustls crypto provider. Exposed for integration
 /// tests, which need it before standing up any TLS server or client.

@@ -60,6 +60,13 @@ pub struct AuditEvent {
     /// belongs to, so analytics counts the request exactly once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub req_seq: Option<u64>,
+    /// Salted request fingerprint (destination + method + pre-swap body; see
+    /// `watch::fingerprint`), on LLM-bound request events. Lets the spend
+    /// tripwire and the waste report recognize a repeated request without the
+    /// log carrying anything derivable back to content. None for non-LLM
+    /// traffic and events written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
     /// SHA-256 of the previous event's `hash` concatenated with this event's
     /// canonical payload. First event chains from all-zero.
     pub prev_hash: String,
@@ -113,6 +120,7 @@ pub struct Entry {
     pub bytes_down: u64,
     pub usage: Option<UsageRec>,
     pub req_seq: Option<u64>,
+    pub fp: Option<String>,
 }
 
 impl Entry {
@@ -156,6 +164,8 @@ enum PayloadVersion {
     Pid,
     /// + sid, dur_ms, bytes_up, bytes_down, usage, req_seq (analytics).
     Analytics,
+    /// + fp (the spend tripwire's salted request fingerprint, plan 002).
+    Fingerprint,
 }
 
 /// Compute an event's chain hash from the previous hash and the event fields.
@@ -191,6 +201,9 @@ fn chain_hash(prev_hash: &str, ev: &AuditEvent, version: PayloadVersion) -> Resu
         fields.push(serde_json::to_value(&ev.usage).context("serializing usage")?);
         fields.push(json!(ev.req_seq));
     }
+    if version >= PayloadVersion::Fingerprint {
+        fields.push(json!(ev.fp));
+    }
     let payload = serde_json::to_vec(&fields).context("serializing audit payload")?;
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
@@ -207,14 +220,23 @@ pub fn verify_link(prev_hash: &str, ev: &AuditEvent) -> bool {
     if ev.prev_hash != prev_hash {
         return false;
     }
-    let Ok(expect) = chain_hash(prev_hash, ev, PayloadVersion::Analytics) else {
+    let Ok(expect) = chain_hash(prev_hash, ev, PayloadVersion::Fingerprint) else {
         return false;
     };
     if ev.hash == expect {
         return true;
     }
+    // Pre-fingerprint events carry no fp; an fp-bearing event rewritten to
+    // None still fails because its stored hash committed to the longer
+    // payload.
+    if ev.fp.is_none()
+        && chain_hash(prev_hash, ev, PayloadVersion::Analytics).is_ok_and(|h| ev.hash == h)
+    {
+        return true;
+    }
     // Pre-analytics events carry none of the new fields.
-    let pre_analytics = ev.sid.is_empty()
+    let pre_analytics = ev.fp.is_none()
+        && ev.sid.is_empty()
         && ev.dur_ms.is_none()
         && ev.bytes_up == 0
         && ev.bytes_down == 0
@@ -307,10 +329,11 @@ impl Auditor {
             bytes_down: entry.bytes_down,
             usage: entry.usage,
             req_seq: entry.req_seq,
+            fp: entry.fp,
             prev_hash: self.prev_hash.clone(),
             hash: String::new(),
         };
-        let hash = chain_hash(&self.prev_hash, &ev, PayloadVersion::Analytics)?;
+        let hash = chain_hash(&self.prev_hash, &ev, PayloadVersion::Fingerprint)?;
         ev.hash = hash.clone();
 
         let line = format!("{}\n", serde_json::to_string(&ev)?);
@@ -377,7 +400,7 @@ pub fn head_anchor() -> Option<(u64, String)> {
 #[cfg(test)]
 pub(crate) fn seal_for_test(prev_hash: &str, ev: &mut AuditEvent) {
     ev.prev_hash = prev_hash.to_string();
-    ev.hash = chain_hash(prev_hash, ev, PayloadVersion::Analytics).unwrap();
+    ev.hash = chain_hash(prev_hash, ev, PayloadVersion::Fingerprint).unwrap();
 }
 
 /// Releases a file lock on drop.
@@ -710,6 +733,7 @@ mod tests {
             bytes_down: 0,
             usage: None,
             req_seq: None,
+            fp: None,
             prev_hash: ZERO_HASH.into(),
             hash: String::new(),
         }
@@ -892,6 +916,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verify().unwrap(), 2);
+    }
+
+    #[test]
+    fn analytics_era_events_verify_and_fp_tamper_breaks_chain() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // Hand-write an event as the pre-fingerprint (analytics) format did:
+        // analytics fields present, no fp, hash over the analytics payload.
+        let mut ev = raw_event("analytics-era.example", "/");
+        ev.ts = "t0".into();
+        ev.sid = "s0".into();
+        ev.dur_ms = Some(7);
+        ev.hash = chain_hash(ZERO_HASH, &ev, PayloadVersion::Analytics).unwrap();
+        crate::config::ensure_home().unwrap();
+        std::fs::write(
+            config::audit_path().unwrap(),
+            format!("{}\n", serde_json::to_string(&ev).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(verify().unwrap(), 1, "analytics-era event must verify");
+
+        // A new fp-bearing append chains onto it and both keep verifying.
+        let mut a = Auditor::open().unwrap();
+        a.append(
+            Entry {
+                host: "new.example".into(),
+                action: "allow".into(),
+                fp: Some("aabbccdd11223344".into()),
+                ..Default::default()
+            },
+            "t1".into(),
+        )
+        .unwrap();
+        assert_eq!(verify().unwrap(), 2);
+
+        // Stripping the fp must not slip through the analytics fallback: the
+        // stored hash committed to the fp-bearing payload.
+        let path = config::audit_path().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tampered = content.replacen(",\"fp\":\"aabbccdd11223344\"", "", 1);
+        assert_ne!(content, tampered, "fixture must contain the fp field");
+        std::fs::write(&path, tampered).unwrap();
+        assert!(verify().is_err());
     }
 
     #[test]
