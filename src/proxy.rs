@@ -284,7 +284,10 @@ async fn pipeline_inner(
     if soft_cfg.enabled()
         && provider.is_some()
         && !over_budget
-        && matches!(decision.action, Action::Allow | Action::Warn)
+        && matches!(
+            decision.action,
+            Action::Allow | Action::Warn | Action::Route
+        )
         && budget_pct.is_some_and(|pct| pct >= soft_cfg.threshold_pct)
         && engine.tier().await >= crate::license::Tier::Pro
     {
@@ -321,6 +324,75 @@ async fn pipeline_inner(
         }
     }
 
+    // 3.45. Model router (plan 006, Pro + a winning `route` rule): rewrite
+    //       the requested model per the rule's explicit map. Runs after the
+    //       soft-landing step, so in the budget band the map applies to the
+    //       model actually about to forward (both rewrites audit
+    //       independently), and before the doctor, the accounting parse, and
+    //       the swap, so every later step sees the body that forwards.
+    //       Security verbs outrank it exactly as they outrank an allow: a
+    //       deny rule never reaches here, the over-budget kill switch is
+    //       checked before the rewrite, and a tripwire or DLP block below
+    //       still denies. The tier read gates only the paid rewrite, never
+    //       reachability — without Pro the rule still allows and the bytes
+    //       ride through untouched. A rule with no map, or a request whose
+    //       model is absent, unmapped, or unidentifiable, forwards
+    //       unmodified: never an error, never a guess. The rewrite is never
+    //       silent: a `route` audit event here (pricing any warm prompt
+    //       cache it forfeits — caches are model-scoped — from the doctor's
+    //       state for the original model), a response header below.
+    let mut route_header: Option<String> = None;
+    if let (Action::Route, Some(prov)) = (decision.action, provider) {
+        if !over_budget && engine.tier().await >= crate::license::Tier::Pro {
+            if let Some(rw) = crate::softland::rewrite_model(&body_bytes, &decision.route) {
+                body_bytes = rw.body;
+                let mut note = format!(
+                    "route: model {} -> {}; provider prompt cache invalidated \
+                     (caches are model-scoped)",
+                    rw.from, rw.to
+                );
+                // Cache-aware routing: when the doctor knows a warm cacheable
+                // prefix for the original model on this host, the note prices
+                // what the rewrite forfeits — that prefix re-bills at the
+                // full input rate instead of the cache-read rate.
+                let warm = engine.cache.lock().await.warm_prefix_bytes(
+                    host,
+                    &rw.from,
+                    crate::util::now_unix(),
+                );
+                if let Some(bytes) = warm {
+                    let rate = engine.pricing.read().await.rate_for(prov, Some(&rw.from));
+                    let waste = crate::cache::repairable_waste_usd(bytes, &rate);
+                    note.push_str(&format!(
+                        "; forfeits a warm {bytes}-byte cached prefix for {} \
+                         (~${waste:.4} re-bills at the full input rate)",
+                        rw.from
+                    ));
+                }
+                // A target the pricing table doesn't know forwards as
+                // configured (the provider errors informatively) but is
+                // flagged: it is likely a typo in the map.
+                if !engine.pricing.read().await.knows_model(&rw.to) {
+                    note.push_str("; target model not in the pricing table");
+                }
+                route_header = Some(format!("{} -> {}", rw.from, rw.to));
+                audit(
+                    engine,
+                    Entry {
+                        host: host.into(),
+                        path: path.clone(),
+                        method: method.clone(),
+                        action: "route".into(),
+                        rule: decision.rule.clone(),
+                        note,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
     // 3.5. Prompt-cache doctor (observe-only, plan 004): diagnose cache
     //      hygiene on the pre-swap body, so nothing the doctor keeps ever
     //      derives from a real secret. Anthropic protocol only (OpenAI's
@@ -331,7 +403,7 @@ async fn pipeline_inner(
     //      provider-bound request and cost one noisy comparison, not a
     //      mutation. The parsed model is reused by the accounting step.
     let cache_active = provider == Some(crate::pricing::Provider::Anthropic)
-        && decision.action == Action::Allow
+        && matches!(decision.action, Action::Allow | Action::Route)
         && !over_budget;
     // Cache repair and active management are Pro conveniences; the tier read
     // never gates a security verb (SPEC invariant), only these paid features.
@@ -479,6 +551,10 @@ async fn pipeline_inner(
         (Action::Deny, format!("dlp: {}{dump_note}", dlp.summary()))
     } else if over_budget {
         (Action::Deny, "budget exhausted".to_string())
+    } else if decision.action == Action::Route {
+        // A route rule forwards and audits exactly like allow; the rewrite
+        // (when one happened) already wrote its own `route` event above.
+        (Action::Allow, String::new())
     } else {
         (decision.action, String::new())
     };
@@ -639,6 +715,10 @@ async fn pipeline_inner(
     // announces itself, so silent quality loss can't erode trust.
     if let Some(h) = &downgrade_header {
         builder = builder.header("x-decoyrail-downgrade", h.as_str());
+    }
+    // And for a routed model (plan 006): the rewrite is never silent.
+    if let Some(h) = &route_header {
+        builder = builder.header("x-decoyrail-route", h.as_str());
     }
 
     // SSE streams pass through untouched (latency-critical). Every other
@@ -1349,7 +1429,9 @@ async fn keepalive_fire(
         .read()
         .await
         .evaluate(host, &tmpl.path, &tmpl.method);
-    if decision.action != Action::Allow {
+    // A route rule allows (the template body already carries whatever model
+    // the pipeline forwarded), so a pre-warm rides it like any allow.
+    if !matches!(decision.action, Action::Allow | Action::Route) {
         return;
     }
     let mut ctx = RequestCtx {

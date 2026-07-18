@@ -105,16 +105,17 @@ impl Engine {
             }
             Err(crate::policy::LoadError::Other(e)) => return Err(e),
         };
-        // Boot-time sanity pass over allow_secrets (see refresh() for the
-        // reload-time counterpart). try_read never fails on the locks we just
-        // created and works both inside and outside a tokio runtime.
-        if let (Ok(v), Ok(p)) = (vault.try_read(), policy.try_read()) {
-            for w in p.lint(&v.secrets) {
+        let meter = Arc::new(Mutex::new(SessionMeter::load()?));
+        let pricing = Arc::new(RwLock::new(Pricing::load()?));
+        // Boot-time sanity pass over allow_secrets and route maps (see
+        // refresh() for the reload-time counterpart). try_read never fails on
+        // the locks we just created and works both inside and outside a
+        // tokio runtime.
+        if let (Ok(v), Ok(p), Ok(pr)) = (vault.try_read(), policy.try_read(), pricing.try_read()) {
+            for w in p.lint(&v.secrets).into_iter().chain(p.lint_routes(&pr)) {
                 eprintln!("decoyrail: policy warning: {w}");
             }
         }
-        let meter = Arc::new(Mutex::new(SessionMeter::load()?));
-        let pricing = Arc::new(RwLock::new(Pricing::load()?));
         let auditor = Arc::new(Mutex::new(Auditor::open()?));
         let dlp_salt = crate::detect::load_or_create_salt()?;
         // Upstream client. No proxy (we ARE the proxy) — and explicitly so:
@@ -290,7 +291,8 @@ impl Engine {
                             known.extend(self.session.secrets.iter().cloned());
                             known
                         };
-                        for w in p.lint(&known) {
+                        let route_warnings = p.lint_routes(&*self.pricing.read().await);
+                        for w in p.lint(&known).into_iter().chain(route_warnings) {
                             eprintln!("decoyrail: policy warning: {w}");
                         }
                         *self.policy.write().await = p;

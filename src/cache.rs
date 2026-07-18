@@ -328,6 +328,22 @@ impl Doctor {
         Some(Observation { model, repair })
     }
 
+    /// The warm cacheable prefix on record for (host, model): the byte size
+    /// of the previous request's cacheable region (tools + system) when that
+    /// request is still within the provider's cache TTL. `None` when nothing
+    /// warm is known — no prior request, an empty cacheable region, or the
+    /// TTL has lapsed. The model router (plan 006) prices what a rewrite
+    /// forfeits from this: caches are model-scoped, so routing away from
+    /// `model` abandons this prefix. Byte-derived like the rest of the
+    /// doctor's accounting, so callers render the price with a `~`.
+    pub fn warm_prefix_bytes(&self, host: &str, model: &str, now_unix: u64) -> Option<u64> {
+        let prev = self.prev.get(&format!("{host} {model}"))?;
+        if prev.cacheable.is_empty() || now_unix.saturating_sub(prev.seen_unix) > CACHE_TTL_SECS {
+            return None;
+        }
+        Some(prev.cacheable.len() as u64)
+    }
+
     /// Record that the proxy actually spliced a marker into a request for this
     /// (host, model): bumps the persisted `repaired` counter.
     pub fn note_repaired(&mut self, host: &str, model: &str) {
@@ -935,6 +951,36 @@ mod tests {
         assert_eq!(div.section, "system");
         assert!(div.offset > 0, "offset should land inside the section");
         assert_eq!(div.gap_secs, 40);
+    }
+
+    #[test]
+    fn warm_prefix_reports_cacheable_bytes_within_ttl_only() {
+        let mut d = Doctor::default();
+        // Nothing observed yet: nothing warm.
+        assert_eq!(d.warm_prefix_bytes("h", "claude-sonnet-5", 100), None);
+        d.observe("h", &body("stable system", &["hi"]), 100);
+        // Within the TTL: the cacheable region (system, before messages[0]).
+        let warm = d
+            .warm_prefix_bytes("h", "claude-sonnet-5", 150)
+            .expect("warm prefix within TTL");
+        assert!(warm > 0);
+        // Other model or host: nothing on record.
+        assert_eq!(d.warm_prefix_bytes("h", "claude-opus-4", 150), None);
+        assert_eq!(d.warm_prefix_bytes("other", "claude-sonnet-5", 150), None);
+        // Past the TTL the cache has lapsed; a rewrite forfeits nothing.
+        assert_eq!(
+            d.warm_prefix_bytes("h", "claude-sonnet-5", 100 + CACHE_TTL_SECS + 1),
+            None
+        );
+        // A body with no cacheable region (no tools/system) is never warm.
+        let mut d = Doctor::default();
+        let bare = serde_json::to_vec(&serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        d.observe("h", &bare, 100);
+        assert_eq!(d.warm_prefix_bytes("h", "claude-sonnet-5", 110), None);
     }
 
     #[test]

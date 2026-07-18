@@ -237,7 +237,7 @@ struct PolicyAddArgs {
     /// Restrict to these path prefixes (repeatable; default any).
     #[arg(long = "path-prefix", value_name = "PREFIX")]
     path_prefixes: Vec<String>,
-    /// allow | deny | warn | escalate.
+    /// allow | deny | warn | route | escalate.
     #[arg(long, default_value = "allow")]
     action: String,
     /// Secret to release here: a vault name or provider:<label> (repeatable).
@@ -276,7 +276,7 @@ struct PolicySetArgs {
     /// Clear the path-prefix restriction (match any path).
     #[arg(long)]
     clear_path_prefixes: bool,
-    /// Change the action (allow | deny | warn | escalate).
+    /// Change the action (allow | deny | warn | route | escalate).
     #[arg(long)]
     action: Option<String>,
     /// Replace the released-secret list (repeatable).
@@ -1234,7 +1234,12 @@ fn after_policy_mutation() -> Result<()> {
 fn print_policy_lint() -> Result<()> {
     let policy = policy::Policy::load_or_default()?;
     let vault = Vault::load_or_init()?;
-    for w in policy.lint(&vault.secrets) {
+    let pricing = pricing::Pricing::load()?;
+    for w in policy
+        .lint(&vault.secrets)
+        .into_iter()
+        .chain(policy.lint_routes(&pricing))
+    {
         eprintln!("decoyrail: policy warning: {w}");
     }
     Ok(())
@@ -1264,6 +1269,7 @@ fn policy_ls(json: bool) -> Result<()> {
                     "methods": r.methods,
                     "path_prefixes": r.path_prefixes,
                     "allow_secrets": r.allow_secrets,
+                    "route": r.route,
                 })
             })
             .collect();
@@ -1298,6 +1304,9 @@ fn policy_ls(json: bool) -> Result<()> {
         }
         if !r.allow_secrets.is_empty() {
             extra.push(format!("releases: {}", r.allow_secrets.join(", ")));
+        }
+        if !r.route.is_empty() {
+            extra.push(format!("routes: {}", fmt_route_map(&r.route)));
         }
         if !extra.is_empty() {
             println!("     {}", extra.join("  |  "));
@@ -1353,7 +1362,9 @@ fn policy_test(url: &str, method: &str) -> Result<()> {
             .filter(|s| d.releases(s))
             .map(|s| s.name.as_str())
             .collect();
-        if d.action == policy::Action::Allow {
+        // A route rule releases exactly like allow (the rewrite touches only
+        // the model field, never the credential).
+        if matches!(d.action, policy::Action::Allow | policy::Action::Route) {
             if released.is_empty() {
                 println!(
                     "  secrets: rule lists [{}]; no matching vault secret to release",
@@ -1374,7 +1385,18 @@ fn policy_test(url: &str, method: &str) -> Result<()> {
             );
         }
     }
+    if !d.route.is_empty() {
+        println!("  routes: {}", fmt_route_map(&d.route));
+    }
     Ok(())
+}
+
+/// Render a route map for human output: `from -> to`, comma-separated.
+fn fmt_route_map(map: &std::collections::BTreeMap<String, String>) -> String {
+    map.iter()
+        .map(|(f, t)| format!("{f} -> {t}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Split a URL or bare host into (host, path). Scheme, userinfo, and port are
@@ -1932,6 +1954,42 @@ fn status_cmd() -> Result<()> {
             println!(
                 "  SOFT-LANDING: spend at {pct:.0}% of budget; mapped models are being downgraded"
             );
+        }
+    }
+    // Model router (plan 006): the policy's active route rules, so redirected
+    // traffic is inspectable at a glance. Without a Pro license the rules are
+    // inert (they still allow, models pass through unchanged) and the header
+    // says so.
+    if let Ok(p) = policy::Policy::load_or_default() {
+        let routes: Vec<_> = p
+            .rules
+            .iter()
+            .filter(|r| r.action == policy::Action::Route)
+            .collect();
+        if !routes.is_empty() {
+            let pro = decoyrail::license::load_installed()
+                .ok()
+                .flatten()
+                .is_some_and(|doc| {
+                    decoyrail::license::effective_tier(&doc, chrono::Utc::now().date_naive())
+                        >= decoyrail::license::Tier::Pro
+                });
+            println!(
+                "Route rules{}:",
+                if pro {
+                    ""
+                } else {
+                    " (inert: no Pro license, models pass through unchanged)"
+                }
+            );
+            for r in routes {
+                let map = if r.route.is_empty() {
+                    "(empty map; behaves like allow)".to_string()
+                } else {
+                    fmt_route_map(&r.route)
+                };
+                println!("  {}: {}  [{}]", r.name, map, r.hosts.join(", "));
+            }
         }
     }
     // Reference dollars are their own labeled line, never a share of Spend,
