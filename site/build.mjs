@@ -60,6 +60,7 @@ const DOCS = [
   { src: 'docs/dlp.md',               out: 'dlp.html',               title: 'Sensitive-data filtering' },
   { src: 'docs/audit-and-metering.md',out: 'audit-and-metering.html',title: 'Audit & metering' },
   { src: 'docs/stats.md',             out: 'stats.html',             title: 'Analytics' },
+  { src: 'docs/license.md',           out: 'license.html',           title: 'Licensing' },
   { src: 'docs/threat-model.md',      out: 'threat-model.html',      title: 'Threat model' },
   { src: 'ROADMAP.md',                out: 'roadmap.html',           title: 'Roadmap' },
 ];
