@@ -69,7 +69,11 @@ verdicts, the one recorded write path (`install`), blessing
 (`decoyrail policy sign`), diff ·
 `audit.rs` hash-chained, lock-serialized, head-anchored tamper-evident log ·
 `meter.rs` spend metering + budget + subscription reference cost and the
-declared plan price/verdict (`decoyrail plan`, plan 019) · `pricing.rs`
+declared plan price/verdict (`decoyrail plan`, plan 019) ·
+`softland.rs` budget soft-landing (plan 003): byte-surgical model downgrade
+per the policy's `[soft_landing]` map, applied by the pipeline in the band
+between `threshold_pct` of the budget and the kill switch (Pro-gated,
+audited as `downgrade`, marked with `x-decoyrail-downgrade`) · `pricing.rs`
 per-model token pricing + provider `usage` accounting (built-in table,
 `pricing.json` overrides) + the billable/reference split (`split_cost`) ·
 `license.rs` offline signed license unlocking paid tiers, fails open to Free

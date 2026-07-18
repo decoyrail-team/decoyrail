@@ -35,7 +35,7 @@ doing and why something was denied.
 
 | Field | Meaning |
 |---|---|
-| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
+| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), `keepalive` (a proxy-initiated cache pre-warm, Pro), or `downgrade` (a budget soft-landing model rewrite, Pro) |
 | `rule` | the policy rule that decided it (`default` when nothing matched) |
 | `escalated` | the matching rule said `escalate` (resolved via fallback) |
 | `swaps` | secrets substituted, as `name@location` |
@@ -282,3 +282,27 @@ How it behaves:
 - **The budget lives in its own file** (`budget.json`), so the proxy's
   frequent usage writes can never clobber a budget you set while it was
   running. Both hot-reload into a running proxy.
+
+## Budget soft-landing (Pro)
+
+The kill switch is binary: under budget everything flows, at 100% everything stops. Soft-landing adds a band in between. Past a threshold you set, requests that name a model in your downgrade map are rewritten to the cheaper model, so the agent keeps working at lower cost instead of hitting the wall at speed. At 100% the kill switch still stops everything, exactly as above.
+
+It switches on in the policy's `[soft_landing]` table (hot-reloaded, like the rest of the policy) and is off by default:
+
+```toml
+[soft_landing]
+threshold_pct = 80
+map = { "claude-opus-4" = "claude-sonnet-5", "gpt-5" = "gpt-5-mini" }
+```
+
+The map is yours. Decoyrail has no built-in opinion about which models are equivalent, and a model with no entry forwards untouched. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A request whose model can't be identified passes through unchanged; Decoyrail never guesses. A map that names a target model the pricing table doesn't know still forwards as configured (the provider errors informatively), and the audit note flags the likely typo.
+
+Downgrades never happen silently:
+
+- every rewritten request gets a `downgrade` audit event naming the mapping and the budget fraction that triggered it,
+- the response carries an `x-decoyrail-downgrade: <from> -> <to>` header,
+- `decoyrail status` says when the session is in the degraded band.
+
+One caveat, which the audit note also states: provider prompt caches are model-scoped, so a model rewrite invalidates the warm cache and the first downgraded request pays a cold cache write for the new model. The visibility exists so that cost stays attributable instead of mysterious.
+
+The threshold reads the same billable spend as the kill switch, so subscription traffic never pushes a session into the band. This is a Pro feature: without a license, or with the table absent, behavior is exactly today's, nothing between a healthy budget and the hard kill switch.
