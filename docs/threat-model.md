@@ -56,6 +56,14 @@ between interception and forwarding.
 - **Tamper-evident history.** Edits, mid-file deletions, and (via the head
   anchor) tail truncation of the audit log are detectable with
   `decoyrail log --verify`. See [audit & metering](audit-and-metering.md).
+- **Policy tampering in place.** The policy loads only when it verifies
+  against a keyed record Decoyrail wrote alongside it, with the key derived
+  from the vault key. An out-of-band edit (or a deleted record, or a policy
+  copied in from another home) fails closed: a fresh start refuses with
+  instructions, and a running proxy keeps the last good policy and writes a
+  `tamper` audit event with alarm prominence. Blessed changes
+  (`decoyrail policy sign`) and CLI edits leave a fingerprinted trail in the
+  audit log. Detection, not prevention; the honest limits are below.
 
 ## What Decoyrail does *not* defend against (in this mode)
 
@@ -75,13 +83,25 @@ Details in
 
 What remains open, stated plainly:
 
-- **Policy tampering in place.** A same-user attacker can skip the fake
-  home and edit the genuine `policy.toml`, pointing a real secret at any
-  host. The `decoyrail policy` subcommands are a convenience over that same
-  plaintext file, not a new capability: anything that can run them can
-  already write the file directly. The policy file is part of the trusted
-  state, not a safety fence against whoever can write it. Authenticating the
-  policy with a keychain-held MAC key is future work.
+- **The deputy signs.** A same-user attacker who edits `policy.toml`
+  directly now trips the fail-closed load, but the same attacker can run
+  `decoyrail policy set` instead; the CLI is a convenience over the same
+  authority. What changed is that the edit rides Decoyrail's own audited
+  path: every policy change is in the hash-chained log with a fingerprint,
+  and the live tail can say "policy changed" as it happens. Detection, not
+  prevention.
+- **Record forgery on the file backend.** The policy record is keyed from
+  the vault key, so its strength tracks the key backend: with `vault.key` in
+  a plain file, an attacker who reads it can forge the record, exactly as
+  they could already decrypt the vault. The keychain backend raises both to
+  a consent prompt in one move, and a consistent same-user attacker can
+  still rewrite every piece of Decoyrail state together, audit log included.
+  Bar-raising, not a cage; prevention awaits the privileged system mode.
+- **Rollback.** A saved older policy-plus-record pair still verifies if
+  restored together. Each blessing's fingerprint is in the audit log, so a
+  rollback is discoverable by comparing the loaded policy against the newest
+  blessing; the same attacker can also rewrite the log, which is the
+  bar-raising argument again.
 - **Consent fatigue.** The keychain turns silent key theft into a visible
   consent prompt; it cannot make a careless approval impossible. A Secure
   Enclave item behind Touch ID is the stronger follow-up.

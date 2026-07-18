@@ -35,7 +35,7 @@ doing and why something was denied.
 
 | Field | Meaning |
 |---|---|
-| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
+| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
 | `rule` | the policy rule that decided it (`default` when nothing matched) |
 | `escalated` | the matching rule said `escalate` (resolved via fallback) |
 | `swaps` | secrets substituted, as `name@location` |

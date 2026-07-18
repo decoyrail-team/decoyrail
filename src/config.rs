@@ -124,6 +124,13 @@ pub fn policy_backup_path() -> Result<PathBuf> {
     Ok(home()?.join("policy.toml.bak"))
 }
 
+/// The policy integrity record (see `integrity.rs`): proof that policy.toml
+/// was written or blessed by Decoyrail for this home. Absence or mismatch
+/// makes the proxy fail closed; deleting it is treated as tampering.
+pub fn policy_sig_path() -> Result<PathBuf> {
+    Ok(home()?.join("policy.toml.sig"))
+}
+
 pub fn audit_path() -> Result<PathBuf> {
     Ok(home()?.join("audit.jsonl"))
 }

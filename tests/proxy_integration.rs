@@ -202,11 +202,13 @@ async fn proxy_end_to_end() {
     // Policy: allow localhost and release the two swappable secrets there
     // (one vault entry by name, one session entry by name), default deny.
     // The honey secret is listed nowhere: seen toward localhost it tripwires.
-    std::fs::write(
-        home.path().join("policy.toml"),
+    // Written through Decoyrail's own recorded write path: plan 018 makes the
+    // engine load only a policy that verifies against its integrity record.
+    decoyrail::policy_edit::write_policy(
         "default_action = \"deny\"\nescalate_fallback = \"deny\"\n\
          [[rule]]\nname = \"local\"\nhosts = [\"localhost\"]\naction = \"allow\"\n\
          allow_secrets = [\"svc\", \"env:LOCAL_TOKEN\"]\n",
+        "test setup",
     )
     .unwrap();
 
@@ -597,7 +599,8 @@ async fn proxy_end_to_end() {
     // lands within the filesystem's timestamp granularity.
     let set_dlp = |dlp: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, format!("{policy_rules}[dlp]\n{dlp}\n")).unwrap();
+        decoyrail::policy_edit::write_policy(&format!("{policy_rules}[dlp]\n{dlp}\n"), "test")
+            .unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -704,12 +707,12 @@ async fn proxy_end_to_end() {
     //     value).
     {
         let path = home.path().join("policy.toml");
-        std::fs::write(
-            &path,
-            format!(
+        decoyrail::policy_edit::write_policy(
+            &format!(
                 "{policy_rules}allow_secrets = [\"env:LOCAL_TOKEN\"]\n\
                  [dlp]\npan = \"block\"\ndebug = true\n"
             ),
+            "test",
         )
         .unwrap();
         let f = std::fs::OpenOptions::new()
@@ -861,7 +864,8 @@ async fn proxy_end_to_end() {
     //     here through the same hot-reload path as `set_dlp`.
     let set_cache = |cache: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, format!("{policy_rules}[cache]\n{cache}\n")).unwrap();
+        decoyrail::policy_edit::write_policy(&format!("{policy_rules}[cache]\n{cache}\n"), "test")
+            .unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)

@@ -62,7 +62,11 @@ sensitive env vars for `decoyrail run` · `swap.rs` decoy↔real substitution + 
 (PAN/SSN/IBAN/ABA/email; block|mask|warn|off per detector in policy `[dlp]`;
 `debug = true` dumps hit payloads, secrets scrubbed, to `dlp-debug/`) ·
 `policy.rs` rules-first egress policy + per-rule secret release
-(`allow_secrets`) ·
+(`allow_secrets`) + the trusted/parse-only load split (`load_trusted` vs
+`load_or_default`) · `integrity.rs` policy integrity (plan 018): keyed record
+in `policy.toml.sig` (HMAC under a key derived from the vault key), verify
+verdicts, the one recorded write path (`install`), blessing
+(`decoyrail policy sign`), diff ·
 `audit.rs` hash-chained, lock-serialized, head-anchored tamper-evident log ·
 `meter.rs` spend metering + budget · `pricing.rs` per-model token pricing +
 provider `usage` accounting (built-in table, `pricing.json` overrides) ·
@@ -104,3 +108,17 @@ modules so `tests/` can drive the pipeline in-process.
   a forwarded request; templates live in memory only, never on disk. Every
   injection and pre-warm is audited (`cache` / `keepalive`).
 - The keychain vault-key backend is presence-selected (item bound to the default home exists), never a config flag, and is consulted only when `DECOYRAIL_HOME` is unset or canonically equal to `~/.decoyrail`, so tests and the e2e script always get the file backend. A release build's first run against the default home mints the key directly in the keychain; dev builds stay on the file (unsigned binaries re-prompt every rebuild). A selected-but-failed keychain read aborts; it must never fall back to minting a fresh file key. The one permitted fallback is first-run creation (`create_default_key`): if the keychain write fails while nothing is encrypted yet, mint the file key instead. Coverage builds (`--cfg coverage`) swap `load_or_create_key` for its file arm so the untestable OS wiring stays out of the diff gate; the logic behind it is covered via mock stores.
+- The proxy loads only a policy that verifies against `policy.toml.sig`
+  (`Policy::load_trusted`): no record, a mismatch, or a missing file with a
+  record all fail closed, with no trust-on-first-use window and no off
+  switch, in every home. The MAC covers raw bytes (byte-identical restore
+  must verify) under a key derived from the vault key, so `decoyrail key
+  migrate` moves both protections and the strength tracks the backend.
+  Every Decoyrail policy write goes through `integrity::install` (record
+  first, then the atomic rename; the reload only re-verifies on an mtime
+  move, and it watches both files). CLI mutations refuse to build on an
+  untrusted file (no tamper laundering); `policy sign` (TTY-only) and
+  `policy reset` are the ways back. A rejected load audits as `tamper`
+  (alarm prominence), distinct from the parse-failure `alert`; every write
+  and blessing audits as `policy` with the file's sha256. Tests write
+  policies via `policy_edit::write_policy`, never `fs::write`.

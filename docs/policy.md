@@ -6,12 +6,13 @@ created with a default pack on first run and hot-reloaded by a running proxy.
 
 ```sh
 decoyrail policy show               # print the current policy
-$EDITOR "$(decoyrail policy path)"  # edit it; a running proxy picks it up
+$EDITOR "$(decoyrail policy path)"  # edit it by hand...
+decoyrail policy sign               # ...then bless the edit; the proxy picks it up
 ```
 
-You can also drive the rules from the command line, the way `iptables` does,
-without opening the file. Every write validates before it lands; see
-[Editing from the CLI](#editing-from-the-cli) below.
+You can also drive the rules from the command line, the way `iptables` does, without opening the file. Every write validates before it lands and needs no blessing; see [Editing from the CLI](#editing-from-the-cli) below.
+
+The policy is the gate that decides where real secrets go, so the proxy loads only a policy that Decoyrail itself wrote or that you blessed with `decoyrail policy sign`; a file changed any other way fails closed. See [Integrity](#integrity-out-of-band-edits-never-load).
 
 ## File format
 
@@ -201,8 +202,10 @@ The file is always yours to edit by hand, but for routine changes the
 `decoyrail policy` subcommands do the same edits without an editor, and they
 keep you from writing a policy the proxy would refuse. Every mutation validates
 that the result still parses, preserves the comments and the rules it doesn't
-touch, keeps a single most-recent backup at `policy.toml.bak`, and replaces the
-file atomically so a running proxy never reads a half-written policy.
+touch, keeps a single most-recent backup at `policy.toml.bak`, replaces the
+file atomically so a running proxy never reads a half-written policy, and
+leaves the file [trusted](#integrity-out-of-band-edits-never-load) with an
+audit event recording the change, so no blessing step is needed.
 
 ### Reading
 
@@ -261,6 +264,32 @@ you make the change, not at the next load.
 `rm`, `flush`, and `reset` ask before they act on a terminal, and require
 `--yes` when run from a script. Any command that fails leaves the file
 untouched and exits non-zero, so you can chain them safely in a shell script.
+
+## Integrity: out-of-band edits never load
+
+Every policy Decoyrail writes gets a record next to it, `policy.toml.sig`: a keyed checksum over the exact file bytes, with the key derived from the same vault key that encrypts your secrets. The proxy loads a policy only when that record verifies. There is no flag for this and no off switch; it applies in every home, and its strength tracks the vault-key backend you already chose (a keychain-held key on macOS after `decoyrail key migrate --to keychain`, a `0600` file otherwise). `decoyrail key migrate` moves both protections together.
+
+Hand edits stay a supported workflow, one command longer:
+
+```sh
+$EDITOR "$(decoyrail policy path)"   # edit the file
+decoyrail policy sign                # review the diff, confirm, done
+```
+
+`policy sign` shows what changed against the last trusted version and asks for confirmation. It only runs on a terminal: the point is that a human read the diff. Signing a file that is already trusted is a quiet no-op, and signing one that does not parse is refused, so a typo cannot become a deny-all surprise at the next restart.
+
+What happens when the file does not verify:
+
+- At startup, the proxy refuses to run and tells you what to do (review, then `decoyrail policy sign`). The refusal is also written to the audit log as a `tamper` event.
+- On a running proxy, the last good policy stays in force and the rejection lands in the audit log as a `tamper` event; `decoyrail log -t` renders it as `[TAMP]`, with the same prominence as a honeytoken alarm.
+- `decoyrail policy ls` prints whether the file on disk is currently trusted, so "will my next restart work" is answerable without restarting.
+- CLI mutations (`policy add`, `dlp set`, ...) refuse to build on an untrusted file, so they cannot silently launder a tamper; `policy sign` and `policy reset` are the two ways back to a trusted state.
+
+Deleting `policy.toml.sig`, deleting `policy.toml` while the record exists, or copying a policy plus record from another home all fail closed the same way. Restoring a tampered file byte-for-byte makes it load again with no blessing, since the record covers the exact bytes.
+
+After an upgrade from a version without integrity records, the first start refuses with the same instructive error: review your policy once, run `decoyrail policy sign`, and you are done.
+
+Honesty note: this is detection, not a cage. Whoever can run code as you can run `decoyrail policy set` themselves; the difference is that the change then rides Decoyrail's own audited path and shows up in the log and the live tail. On the file key backend, an attacker who reads `vault.key` can forge the record too, exactly as they could already open the vault. The [threat model](threat-model.md) spells this out.
 
 ## Interaction with the rest of the pipeline
 

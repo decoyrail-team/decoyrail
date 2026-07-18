@@ -287,6 +287,13 @@ previous version stays active, and the failure is announced on stderr and as
 an `alert` event in the audit log. Without that alert, a broken policy push
 would look deployed while endpoints kept enforcing the old rules.
 
+A policy edit made outside Decoyrail's own surfaces is a different story
+told separately: the file fails integrity verification, the previous policy
+stays active, and the rejection is a `tamper` event with alarm prominence
+(`[TAMP]` in `decoyrail log -t`). Hand edits take effect after
+`decoyrail policy sign`; see the
+[policy reference](policy.md#integrity-out-of-band-edits-never-load).
+
 ## Everything lives in `~/.decoyrail`
 
 The directory is created `0700` (existing directories from older installs
@@ -297,7 +304,8 @@ are tightened on next run).
 | `ca-cert.pem` / `ca-key.pem` | per-device CA (leaf certs minted per host); the key is `0600` |
 | `vault.json` | encrypted vault (ChaCha20-Poly1305) |
 | `vault.key` | vault key, `0600`; absent when the key lives in the login keychain instead (release installs start there, `decoyrail key migrate` moves it either way) |
-| `policy.toml` | egress policy, human-editable |
+| `policy.toml` | egress policy, human-editable (hand edits need `decoyrail policy sign`) |
+| `policy.toml.sig` | policy integrity record; the proxy loads only a policy that verifies against it |
 | `audit.jsonl` + `audit.head` | hash-chained audit log + head anchor |
 | `meter.json` / `budget.json` | per-host spend accounting (per-model token counts for LLM hosts) / monthly budget |
 | `pricing.json` (optional) | per-model rate, provider host, and billing overrides |

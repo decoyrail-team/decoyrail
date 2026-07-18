@@ -27,7 +27,8 @@ use crate::config;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// On-disk cache format; a mismatch discards the cache and rebuilds.
-const CACHE_VERSION: u32 = 1;
+// v2: policy integrity counters (plan 018); older caches rebuild from the log.
+const CACHE_VERSION: u32 = 2;
 
 /// Duration histogram: bucket `i` covers [2^(i-1), 2^i) milliseconds (bucket
 /// 0 is exactly 0ms), the last bucket is open-ended. 22 buckets reach ~35min.
@@ -118,6 +119,12 @@ pub struct Bucket {
     pub tripwires: u64,
     /// DLP warn/mask alerts (blocking hits count under `deny_dlp`).
     pub dlp_alerts: u64,
+    /// Policy loads rejected as tampered (`tamper` events): out-of-band
+    /// edits, deleted records, unblessed files.
+    pub policy_tamper: u64,
+    /// Policy writes and blessings through Decoyrail surfaces (`policy`
+    /// events).
+    pub policy_changes: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -143,6 +150,8 @@ impl Bucket {
         self.deny_budget += o.deny_budget;
         self.tripwires += o.tripwires;
         self.dlp_alerts += o.dlp_alerts;
+        self.policy_tamper += o.policy_tamper;
+        self.policy_changes += o.policy_changes;
         self.input_tokens += o.input_tokens;
         self.output_tokens += o.output_tokens;
         self.cache_read_tokens += o.cache_read_tokens;
@@ -412,6 +421,10 @@ impl Aggregator {
                     self.bucket(&hour, &ev.sid, &ev.host, "").dlp_alerts += 1;
                 }
             }
+            // Policy integrity (plan 018): rejected loads and Decoyrail-made
+            // changes are both part of the security story stats tells.
+            "tamper" => self.bucket(&hour, &ev.sid, &ev.host, "").policy_tamper += 1,
+            "policy" => self.bucket(&hour, &ev.sid, &ev.host, "").policy_changes += 1,
             "usage" => self.apply_usage(ev, &hour),
             _ => {}
         }
@@ -653,6 +666,10 @@ pub struct BucketOut {
     pub denies: DeniesOut,
     pub tripwires: u64,
     pub dlp_alerts: u64,
+    /// Policy loads rejected as tampered, and policy changes made through
+    /// Decoyrail surfaces (writes and blessings).
+    pub policy_tamper: u64,
+    pub policy_changes: u64,
     pub tokens: TokensOut,
     pub cache_hit_ratio: Option<f64>,
     pub cost_usd: f64,
@@ -677,6 +694,8 @@ impl BucketOut {
             },
             tripwires: b.tripwires,
             dlp_alerts: b.dlp_alerts,
+            policy_tamper: b.policy_tamper,
+            policy_changes: b.policy_changes,
             tokens: TokensOut {
                 input: b.input_tokens,
                 output: b.output_tokens,
@@ -712,6 +731,7 @@ impl BucketOut {
     pub fn alert_count(&self) -> u64 {
         self.denies.total
             + self.dlp_alerts
+            + self.policy_tamper
             + self.warns
             + self.tripwires.saturating_sub(self.denies.tripwire)
     }
@@ -777,7 +797,13 @@ pub fn query(window: &Window) -> Result<Report> {
     let mut by_day: BTreeMap<String, Bucket> = BTreeMap::new();
     for (key, bucket) in agg.rows.iter().filter(|(k, _)| in_window(&k.hour)) {
         totals.merge(bucket);
-        by_session.entry(key.sid.clone()).or_default().merge(bucket);
+        // Sessionless rows either predate session tracking (they carry
+        // traffic) or are request-free CLI events like a `policy add` from
+        // another terminal; only the former deserve a session row. Totals
+        // count both either way.
+        if !key.sid.is_empty() || bucket.requests > 0 || bucket.bytes_up > 0 {
+            by_session.entry(key.sid.clone()).or_default().merge(bucket);
+        }
         if !key.model.is_empty() {
             by_model.entry(key.model.clone()).or_default().merge(bucket);
         } else if bucket.requests > 0 || bucket.bytes_up > 0 || bucket.bytes_down > 0 {
@@ -1004,9 +1030,16 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
     // Zeros print on purpose: a quiet window is itself a report.
     let _ = writeln!(
         out,
-        "Security: {} tripwire hits, {} DLP alerts",
-        t.tripwires, t.dlp_alerts
+        "Security: {} tripwire hits, {} DLP alerts, {} policy tampers",
+        t.tripwires, t.dlp_alerts, t.policy_tamper
     );
+    if t.policy_changes > 0 {
+        let _ = writeln!(
+            out,
+            "Policy: {} change(s) through decoyrail surfaces",
+            t.policy_changes
+        );
+    }
     let cached = t
         .cache_hit_ratio
         .map(|r| format!("  cached {:.0}%", r * 100.0))
@@ -1295,6 +1328,27 @@ mod tests {
         assert_eq!(june.totals.denies.dlp, 0);
         let human = render_human(&june, Breakdown::Model);
         assert!(human.contains("0 dlp"), "zeros must print:\n{human}");
+    }
+
+    #[test]
+    fn policy_tamper_and_change_events_are_counted() {
+        let (_g, _dir) = setup();
+        let mut a = Auditor::open().unwrap();
+        let mut tamper = Entry::note("tamper", "policy rejected; previous stays active".into());
+        tamper.sid = "s1".into();
+        a.append(tamper, "2026-06-05T10:00:00.000Z".into()).unwrap();
+        let mut change = Entry::note("policy", "policy updated (policy add); sha256=abc".into());
+        change.sid = "s1".into();
+        a.append(change, "2026-06-05T10:01:00.000Z".into()).unwrap();
+
+        let report = query(&wide()).unwrap();
+        assert_eq!(report.totals.policy_tamper, 1);
+        assert_eq!(report.totals.policy_changes, 1);
+        // A tamper counts as an alert; a Decoyrail-made change does not.
+        assert_eq!(report.totals.alert_count(), 1);
+        let human = render_human(&report, Breakdown::Host);
+        assert!(human.contains("1 policy tampers"), "{human}");
+        assert!(human.contains("1 change(s)"), "{human}");
     }
 
     #[test]

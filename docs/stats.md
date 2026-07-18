@@ -21,7 +21,7 @@ A typical report:
 ```
 Window: today (2026-07-10T04 to 2026-07-11T04 UTC)
 Requests: 41 (39 allowed, 0 warned, 2 denied: 1 policy, 1 tripwire, 0 dlp, 0 budget)
-Security: 1 tripwire hits, 0 DLP alerts
+Security: 1 tripwire hits, 0 DLP alerts, 0 policy tampers
 Tokens: in 48.2k  out 12.9k  cache read 1.1M  cache write 22.0k  cached 96%
 Spend: $1.8420
 Bytes: up 1.2 MB  down 6.4 MB
@@ -104,7 +104,7 @@ total tokens, dollars, and alert count, in that order.
 ```
 
 The alert count is denies plus tripwire hits plus DLP alerts plus warn
-events, each counted once. If the audit chain fails verification the line is prefixed
+events plus policy tampers, each counted once. If the audit chain fails verification the line is prefixed
 with `[audit integrity FAILED] `. This format is a compatibility promise:
 poll it from a menu bar app or a statusline every few seconds and nothing
 about it will change shape within a major version. For anything richer, use
@@ -141,6 +141,8 @@ rows alike, has the same shape:
 | `denies` | `{total, policy, tripwire, dlp, budget}`, denies by reason |
 | `tripwires` | tripwire hits: request-side denies plus response echoes |
 | `dlp_alerts` | DLP warn or mask hits (blocking hits are in `denies.dlp`) |
+| `policy_tamper` | policy loads rejected as tampered (out-of-band edit, missing record) |
+| `policy_changes` | policy writes and blessings made through Decoyrail surfaces |
 | `tokens` | `{input, output, cache_read, cache_write, total}` |
 | `cache_hit_ratio` | `cache_read / (input + cache_read)`, null with no context tokens |
 | `cost_usd` | sum of per-request metered cost (subscription traffic is $0) |

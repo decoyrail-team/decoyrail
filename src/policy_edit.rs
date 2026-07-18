@@ -70,9 +70,9 @@ impl PolicyDoc {
     }
 
     /// Validate and persist this document (see [`write_policy`]); returns the
-    /// backup path.
-    pub fn save(&self) -> Result<PathBuf> {
-        write_policy(&self.render())
+    /// backup path. `source` names the CLI surface for the audit event.
+    pub fn save(&self, source: &str) -> Result<PathBuf> {
+        write_policy(&self.render(), source)
     }
 
     fn aot(&self) -> Option<&ArrayOfTables> {
@@ -347,22 +347,32 @@ fn resolve_anchor(anchor: &Anchor, tables: &[Table]) -> Result<usize> {
     })
 }
 
-/// The one validated, backed-up, atomic write path for the policy. Rejects any
-/// text that doesn't parse as a `Policy` (so the file on disk always loads),
-/// keeps a single most-recent backup, and replaces the file atomically so the
-/// proxy never reads a torn write. Returns the backup path.
-pub fn write_policy(new_text: &str) -> Result<PathBuf> {
+/// The CLI write path for the policy. Rejects any text that doesn't parse as
+/// a `Policy` (so the file on disk always loads), then hands off to
+/// `integrity::install` for the backed-up, recorded, atomic, audited write.
+/// Returns the backup path.
+///
+/// One gate first: the file being edited must itself be trusted. A CLI
+/// mutation rewrites the whole document, so editing on top of a tampered
+/// file would launder the tamper into a blessed policy nobody reviewed.
+/// `decoyrail policy sign` (review and confirm) and `decoyrail policy reset`
+/// (fresh defaults) are the two ways out of that state.
+pub fn write_policy(new_text: &str, source: &str) -> Result<PathBuf> {
     toml::from_str::<Policy>(new_text)
         .context("refusing to write: the result is not a valid policy")?;
-    config::ensure_home()?;
     let path = config::policy_path()?;
-    let backup = config::policy_backup_path()?;
     if path.exists() {
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("backing up {} to {}", path.display(), backup.display()))?;
+        let current = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let verdict = crate::integrity::verify(&current)?;
+        if verdict != crate::integrity::Verdict::Trusted {
+            anyhow::bail!(
+                "refusing to edit an untrusted policy: {}",
+                crate::integrity::untrusted_message(verdict)
+            );
+        }
     }
-    config::atomic_write(&path, new_text.as_bytes())?;
-    Ok(backup)
+    crate::integrity::install(new_text, source)
 }
 
 #[cfg(test)]
@@ -592,6 +602,35 @@ action = "deny"
     #[test]
     fn write_policy_rejects_invalid() {
         // Not a valid policy (bad action value) → refused, error, no panic.
-        assert!(write_policy("default_action = \"sideways\"").is_err());
+        // Validation runs before any filesystem access, so this needs no home.
+        assert!(write_policy("default_action = \"sideways\"", "test").is_err());
+    }
+
+    #[test]
+    fn write_policy_records_and_refuses_untrusted_current() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // A CLI write leaves a file the proxy will trust, with no extra step.
+        write_policy(DEFAULT_POLICY_TOML, "test").unwrap();
+        assert!(Policy::load_trusted().is_ok());
+
+        // A structured edit through PolicyDoc round-trips the same way.
+        let mut doc = PolicyDoc::load().unwrap();
+        doc.set_default("deny").unwrap();
+        doc.save("test").unwrap();
+        assert!(Policy::load_trusted().is_ok());
+
+        // Hand-tamper the file: the next CLI edit refuses rather than
+        // laundering the tamper into a blessed policy, and points at sign.
+        let path = config::policy_path().unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push('#');
+        std::fs::write(&path, &text).unwrap();
+        let err = write_policy(DEFAULT_POLICY_TOML, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy sign"), "{err}");
     }
 }

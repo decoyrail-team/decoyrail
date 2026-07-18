@@ -257,17 +257,84 @@ impl Decision {
     }
 }
 
-impl Policy {
-    pub fn load_or_default() -> Result<Self> {
-        config::ensure_home()?;
-        let path = config::policy_path()?;
-        if !path.exists() {
-            std::fs::write(&path, DEFAULT_POLICY_TOML)?;
+/// Why a trusted policy load was refused. The two arms tell different
+/// stories downstream: `Untrusted` is a tamper event (alarm prominence),
+/// `Other` is the ordinary broken-file path (parse failure, unreadable
+/// state). Both fail closed.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The file was changed outside Decoyrail, has no integrity record, or
+    /// is missing while its record exists. Carries the full instructive
+    /// message for humans.
+    Untrusted(String),
+    Other(anyhow::Error),
+}
+
+impl LoadError {
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            LoadError::Untrusted(msg) => anyhow::anyhow!(msg),
+            LoadError::Other(e) => e,
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+    }
+}
+
+/// Read the policy text, materializing the shipped default (through the
+/// recorded write path, so it is born trusted) on a genuinely fresh home. A
+/// missing file whose integrity record exists is not fresh: a deleted
+/// policy is an edit, and re-materializing over it would silently re-bless.
+fn read_or_materialize() -> Result<String, LoadError> {
+    let inner = || -> Result<std::path::PathBuf> {
+        config::ensure_home()?;
+        config::policy_path()
+    };
+    let path = inner().map_err(LoadError::Other)?;
+    if !path.exists() {
+        let sig_exists = config::policy_sig_path()
+            .map(|p| p.exists())
+            .map_err(LoadError::Other)?;
+        if sig_exists {
+            return Err(LoadError::Untrusted(format!(
+                "{} is missing but its integrity record exists; a deleted policy is an \
+                 edit. Restore the file (last backup: {}), or start over with \
+                 `decoyrail policy reset`.",
+                path.display(),
+                config::policy_backup_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "policy.toml.bak".into()),
+            )));
+        }
+        crate::integrity::install(DEFAULT_POLICY_TOML, "default policy")
+            .map_err(LoadError::Other)?;
+    }
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))
+        .map_err(LoadError::Other)
+}
+
+impl Policy {
+    /// Parse-only load for CLI read paths (`policy ls`, `policy test`,
+    /// `vault ls`): these report on the file, including an untrusted one,
+    /// and never release a secret. The proxy loads via [`Self::load_trusted`].
+    pub fn load_or_default() -> Result<Self> {
+        let text = read_or_materialize().map_err(LoadError::into_anyhow)?;
         let policy: Policy = toml::from_str(&text).context("parsing policy.toml")?;
         Ok(policy)
+    }
+
+    /// The proxy's load: only a policy Decoyrail wrote or blessed for this
+    /// home. Verification is silent and applies in every home; anything
+    /// unverifiable is [`LoadError::Untrusted`], which callers surface with
+    /// alarm prominence and fail closed on.
+    pub fn load_trusted() -> Result<Self, LoadError> {
+        let text = read_or_materialize()?;
+        match crate::integrity::verify(&text) {
+            Ok(crate::integrity::Verdict::Trusted) => toml::from_str(&text)
+                .context("parsing policy.toml")
+                .map_err(LoadError::Other),
+            Ok(v) => Err(LoadError::Untrusted(crate::integrity::untrusted_message(v))),
+            Err(e) => Err(LoadError::Other(e)),
+        }
     }
 
     pub fn evaluate(&self, host: &str, path: &str, method: &str) -> Decision {
@@ -843,6 +910,78 @@ debug = true
         assert!(!p.cache.repair);
         assert!(!p.cache.keep_alive);
         assert!(!p.cache.serialize_fanout);
+    }
+
+    #[test]
+    fn load_trusted_only_loads_what_decoyrail_wrote() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // Fresh home: the materialized default is born trusted.
+        assert!(Policy::load_trusted().is_ok());
+
+        // One appended byte: untrusted, with the cure named.
+        let path = crate::config::policy_path().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}#")).unwrap();
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Untrusted(_)), "{err:?}");
+        let msg = err.into_anyhow().to_string();
+        assert!(msg.contains("policy sign"), "{msg}");
+        // CLI read paths still parse the untrusted file (they report on it,
+        // and `policy ls` says it is untrusted; they release nothing).
+        assert!(Policy::load_or_default().is_ok());
+
+        // Byte-identical restore: trusted again, no blessing needed.
+        std::fs::write(&path, &text).unwrap();
+        assert!(Policy::load_trusted().is_ok());
+
+        // Record deleted, file untouched: absence of proof is absence of
+        // trust, never a cue to re-bless silently.
+        std::fs::remove_file(crate::config::policy_sig_path().unwrap()).unwrap();
+        assert!(matches!(
+            Policy::load_trusted(),
+            Err(LoadError::Untrusted(_))
+        ));
+    }
+
+    #[test]
+    fn deleted_policy_with_record_is_an_edit() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        assert!(Policy::load_trusted().is_ok());
+        std::fs::remove_file(crate::config::policy_path().unwrap()).unwrap();
+
+        // Neither load may re-materialize a default over the evidence.
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Untrusted(_)), "{err:?}");
+        assert!(err.into_anyhow().to_string().contains("policy reset"));
+        assert!(Policy::load_or_default().is_err());
+        assert!(!crate::config::policy_path().unwrap().exists());
+    }
+
+    /// An unreadable record is the ordinary broken-file error (`Other`), not
+    /// the tamper story: nothing claims an edit happened, the load just
+    /// cannot prove anything either way and fails closed with the cause.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_record_is_other_not_tamper() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        assert!(Policy::load_trusted().is_ok());
+        let sig = crate::config::policy_sig_path().unwrap();
+        std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Other(_)), "{err:?}");
+        assert!(err.into_anyhow().to_string().contains("reading"));
+        std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Policy::load_trusted().is_ok());
     }
 
     #[test]

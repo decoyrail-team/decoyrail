@@ -187,6 +187,8 @@ enum PolicyCmd {
     Reset(PolicyConfirmArgs),
     /// Edit the policy with $EDITOR and validate it before saving.
     Edit,
+    /// Bless a hand-edited policy after reviewing what changed (TTY only).
+    Sign,
 }
 
 #[derive(Args)]
@@ -672,7 +674,7 @@ fn append_release_rule(name: &str, hosts: &[String]) -> Result<()> {
     ));
     let _: policy::Policy =
         toml::from_str(&text).context("appending the rule would break policy.toml; not written")?;
-    config::atomic_write(&path, text.as_bytes())?;
+    decoyrail::policy_edit::write_policy(&text, "vault add --allow-host")?;
     println!("Policy rule '{name}' appended to {}.", path.display());
     Ok(())
 }
@@ -989,7 +991,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             doc.add(&edit, &anchor)?;
-            doc.save()?;
+            doc.save("policy add")?;
             println!("Added rule '{}'.", a.name);
             after_policy_mutation()?;
         }
@@ -1004,7 +1006,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             let name = doc.set(&a.rule, &edit)?;
-            doc.save()?;
+            doc.save("policy set")?;
             println!("Updated rule '{name}'.");
             after_policy_mutation()?;
         }
@@ -1017,7 +1019,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
                 println!("Aborted; policy unchanged.");
                 return Ok(());
             }
-            let backup = doc.save()?;
+            let backup = doc.save("policy rm")?;
             println!("Removed rule '{name}'. Backup at {}.", backup.display());
             after_policy_mutation()?;
         }
@@ -1035,7 +1037,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             let name = doc.move_rule(&a.rule, &anchor)?;
-            doc.save()?;
+            doc.save("policy mv")?;
             println!("Moved rule '{name}'.");
             after_policy_mutation()?;
         }
@@ -1043,11 +1045,11 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             let mut doc = PolicyDoc::load()?;
             if a.fallback {
                 doc.set_escalate_fallback(&a.action)?;
-                doc.save()?;
+                doc.save("policy default --fallback")?;
                 println!("Escalate fallback set to {}.", a.action.to_lowercase());
             } else {
                 doc.set_default(&a.action)?;
-                doc.save()?;
+                doc.save("policy default")?;
                 println!("Default action set to {}.", a.action.to_lowercase());
                 if matches!(policy::Action::parse(&a.action), Ok(policy::Action::Warn)) {
                     println!(
@@ -1075,7 +1077,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
                 return Ok(());
             }
             doc.flush();
-            let backup = doc.save()?;
+            let backup = doc.save("policy flush")?;
             println!("Flushed all rules. Backup at {}.", backup.display());
             if matches!(default, policy::Action::Deny) {
                 println!(
@@ -1086,20 +1088,83 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             after_policy_mutation()?;
         }
         PolicyCmd::Reset(a) => {
-            policy::Policy::load_or_default()?; // ensure there's something to back up
             if !confirm("Overwrite the policy with the shipped defaults?", a.yes)? {
                 println!("Aborted; policy unchanged.");
                 return Ok(());
             }
-            let backup = decoyrail::policy_edit::write_policy(policy::DEFAULT_POLICY_TOML)?;
-            println!(
-                "Policy reset to the shipped defaults. Previous policy backed up at {}.",
-                backup.display()
-            );
+            // The unchecked install on purpose: reset is the recovery path
+            // out of an untrusted or deleted policy, and what it writes is
+            // the shipped default, not anything derived from the file.
+            let backup =
+                decoyrail::integrity::install(policy::DEFAULT_POLICY_TOML, "policy reset")?;
+            if backup.exists() {
+                println!(
+                    "Policy reset to the shipped defaults. Previous policy backed up at {}.",
+                    backup.display()
+                );
+            } else {
+                println!("Policy reset to the shipped defaults.");
+            }
             after_policy_mutation()?;
         }
         PolicyCmd::Edit => policy_edit()?,
+        PolicyCmd::Sign => policy_sign()?,
     }
+    Ok(())
+}
+
+/// `decoyrail policy sign`: bless a hand-edited policy. Shows what changed
+/// against the last trusted version, asks for confirmation on a TTY, and
+/// refuses to run without one; scripting around the review on purpose is
+/// the user's choice to make interactively, not a flag.
+fn policy_sign() -> Result<()> {
+    use decoyrail::integrity::{self, Verdict};
+    use std::io::IsTerminal;
+
+    // Materializes a trusted default on a fresh home, and refuses broken
+    // TOML before anything else: blessing a typo would turn it into a
+    // deny-all surprise at the next restart.
+    policy::Policy::load_or_default()?;
+    let path = config::policy_path()?;
+    let text = std::fs::read_to_string(&path)?;
+    if integrity::verify(&text)? == Verdict::Trusted {
+        println!("Policy already trusted; nothing to bless.");
+        return Ok(());
+    }
+    match integrity::baseline()? {
+        Some((old, at)) => {
+            let changes = integrity::diff(&old, &text);
+            if changes.is_empty() {
+                println!("No line-level changes since the last blessing ({at}); the files differ only in bytes lines don't show (line endings, a trailing newline).");
+            } else {
+                println!("Changes since the last blessed policy ({at}):");
+                for line in &changes {
+                    println!("  {line}");
+                }
+            }
+        }
+        None => println!(
+            "No trusted baseline to diff against; review {} in full before confirming.",
+            path.display()
+        ),
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "refusing to bless without a terminal: `decoyrail policy sign` wants \
+             a human to review the changes above and confirm interactively"
+        ));
+    }
+    eprint!("Bless this policy for this machine? [y/N] ");
+    use std::io::Write as _;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Aborted; nothing blessed.");
+        return Ok(());
+    }
+    let fp = integrity::bless_current()?;
+    println!("Policy blessed (sha256={fp}). A running proxy picks it up on the next request.");
     Ok(())
 }
 
@@ -1163,6 +1228,12 @@ fn print_policy_lint() -> Result<()> {
 /// default action and escalate fallback.
 fn policy_ls(json: bool) -> Result<()> {
     let policy = policy::Policy::load_or_default()?;
+    // Whether the file on disk is currently trusted, so "will my next
+    // restart work" is answerable without restarting.
+    let trusted = {
+        let text = std::fs::read_to_string(config::policy_path()?)?;
+        decoyrail::integrity::verify(&text)? == decoyrail::integrity::Verdict::Trusted
+    };
     if json {
         let rules: Vec<_> = policy
             .rules
@@ -1185,6 +1256,7 @@ fn policy_ls(json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "default_action": policy.default_action.as_str(),
                 "escalate_fallback": policy.escalate_fallback.as_str(),
+                "trusted": trusted,
                 "rules": rules,
             }))?
         );
@@ -1220,6 +1292,14 @@ fn policy_ls(json: bool) -> Result<()> {
         policy.default_action.as_str(),
         policy.escalate_fallback.as_str()
     );
+    if trusted {
+        println!("integrity: trusted (the proxy loads this file)");
+    } else {
+        println!(
+            "integrity: NOT TRUSTED. The file was changed outside decoyrail; the proxy \
+             will not load it. Review it, then run `decoyrail policy sign`."
+        );
+    }
     print_policy_lint()?;
     Ok(())
 }
@@ -1327,7 +1407,7 @@ fn policy_edit() -> Result<()> {
         }
         // Validate before it replaces the live file; on a parse error the live
         // policy stays put.
-        decoyrail::policy_edit::write_policy(&edited)
+        decoyrail::policy_edit::write_policy(&edited, "policy edit")
             .context("edited policy rejected; the live policy is unchanged")?;
         println!("Policy updated.");
         after_policy_mutation()?;
@@ -1385,7 +1465,7 @@ fn dlp_cmd(cmd: DlpCmd) -> Result<()> {
                 toml_edit::value(mode.clone())
             };
             // Edit in place, preserving the user's comments and rule layout;
-            // validate the result parses before it replaces the live policy.
+            // write_policy validates the result and leaves it trusted.
             let path = config::policy_path()?;
             let text = std::fs::read_to_string(&path)?;
             let mut doc = text
@@ -1393,8 +1473,7 @@ fn dlp_cmd(cmd: DlpCmd) -> Result<()> {
                 .context("parsing policy.toml")?;
             doc["dlp"][detector.as_str()] = value;
             let edited = doc.to_string();
-            toml::from_str::<policy::Policy>(&edited).context("edited policy failed to parse")?;
-            config::atomic_write(&path, edited.as_bytes())?;
+            decoyrail::policy_edit::write_policy(&edited, "dlp set")?;
             println!("Set {detector} = {mode}. A running proxy picks it up on the next request.");
             if detector == "debug" && matches!(mode.as_str(), "on" | "true") {
                 println!(
@@ -1614,7 +1693,11 @@ fn print_audit_line(line: &str) {
     let Ok(ev) = serde_json::from_str::<audit::AuditEvent>(line) else {
         return;
     };
-    let flag = if !ev.tripwires.is_empty() {
+    // A rejected policy load is the same class of news as a honeytoken
+    // alarm: someone or something edited the release gate out-of-band.
+    let flag = if ev.action == "tamper" {
+        "[TAMP]"
+    } else if !ev.tripwires.is_empty() {
         "[TRIP]"
     } else if ev.action == "deny" {
         "[DENY]"
