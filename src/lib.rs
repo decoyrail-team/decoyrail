@@ -19,6 +19,7 @@ pub mod policy;
 pub mod policy_edit;
 pub mod pricing;
 pub mod proxy;
+pub mod softland;
 pub mod stats;
 pub mod swap;
 pub mod util;

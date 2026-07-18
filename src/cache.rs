@@ -574,7 +574,7 @@ fn injection_point(body: &[u8]) -> Option<usize> {
     None
 }
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
+pub(crate) fn skip_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && (b[i] as char).is_whitespace() {
         i += 1;
     }
@@ -642,8 +642,9 @@ fn skip_value(b: &[u8], i: usize) -> Option<usize> {
 }
 
 /// The value span (start..end) of member `key` in the object whose `{` is at
-/// `obj_open`. `start` is the first non-ws byte of the value.
-fn object_member_value(b: &[u8], obj_open: usize, key: &str) -> Option<(usize, usize)> {
+/// `obj_open`. `start` is the first non-ws byte of the value. Shared with the
+/// soft-landing model rewrite (plan 003), which edits the same byte surface.
+pub(crate) fn object_member_value(b: &[u8], obj_open: usize, key: &str) -> Option<(usize, usize)> {
     let mut i = skip_ws(b, obj_open + 1);
     while i < b.len() && b[i] != b'}' {
         // Member key.
