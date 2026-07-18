@@ -25,10 +25,13 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 /// Verification keys baked into release builds (hex Ed25519 public keys).
-/// Empty until the private issuing tool exists and mints the release keypair;
-/// a list (not one key) so a future release can rotate keys while honoring
-/// already-issued licenses until their expiry.
-const RELEASE_KEYS_HEX: &[&str] = &[];
+/// A list (not one key) so a future release can rotate keys while honoring
+/// already-issued licenses until their expiry. The private halves never touch
+/// this repository; signing lives in the private issuing tool.
+const RELEASE_KEYS_HEX: &[&str] = &[
+    // Production key 1, minted 2026-07-18.
+    "9dfcb03ae6bb4813c9843ab80971c1af9e3f5c94cd75404be64ac6c7ee524459",
+];
 
 /// The tiers the binary knows, lowest to highest. Free is the no-license
 /// state and is never encoded in a license file we issue.
@@ -318,6 +321,23 @@ mod tests {
 
     fn d(s: &str) -> NaiveDate {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn embedded_release_keys_are_valid_and_trusted() {
+        let _g = crate::util::env_guard();
+        std::env::remove_var("DECOYRAIL_LICENSE_EXTRA_KEY");
+        // A release must be able to verify a sold license: at least one
+        // embedded key, every one a well-formed 32-byte Ed25519 public key,
+        // and trust_keys() must carry them all.
+        assert!(!RELEASE_KEYS_HEX.is_empty());
+        let keys = trust_keys();
+        assert_eq!(keys.len(), RELEASE_KEYS_HEX.len());
+        for h in RELEASE_KEYS_HEX {
+            let k = hex::decode(h).unwrap();
+            assert_eq!(k.len(), 32);
+            assert!(keys.contains(&k));
+        }
     }
 
     #[test]
