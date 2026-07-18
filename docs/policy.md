@@ -179,6 +179,8 @@ Policy-wise it is an allow. Secrets release through `allow_secrets` the same way
 
 The map is yours, like the soft-landing map: Decoyrail has no built-in opinion about which models are equivalent. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A rule with no map, or a request whose model is absent, unmapped, or unidentifiable, forwards unmodified. Never an error, never a guess.
 
+![A route rule rewrites an opus request to haiku before it forwards, marked with x-decoyrail-route on the response and recorded in the audit log](demos/model-route.gif)
+
 Rewrites never happen silently:
 
 - every rewritten request gets a `route` audit event naming the rule and the mapping,
@@ -334,6 +336,8 @@ decoyrail policy sign                # review the diff, confirm, done
 ```
 
 `policy sign` shows what changed against the last trusted version and asks for confirmation. It only runs on a terminal: the point is that a human read the diff. Signing a file that is already trusted is a quiet no-op, and signing one that does not parse is refused, so a typo cannot become a deny-all surprise at the next restart.
+
+![A hand edit to policy.toml is refused everywhere until decoyrail policy sign shows the diff and a human blesses it](demos/policy-sign.gif)
 
 What happens when the file does not verify:
 

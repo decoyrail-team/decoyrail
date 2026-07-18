@@ -400,7 +400,7 @@ const PLANS = [
       'Model routing by policy',
       'Email support',
     ],
-    cta: { label: 'Get launch pricing', href: contact('Pro'), primary: true },
+    cta: { label: 'Get Pro', href: contact('Pro'), primary: true },
     featured: true,
   },
   {

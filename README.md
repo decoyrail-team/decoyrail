@@ -44,12 +44,19 @@ This README covers what works today; what's coming next is in
   default-deny posture and a starter pack tuned for coding agents.
   Reachability and secret release live in the same rules. `escalate` fails
   closed to deny (no judge tier yet).
+- **Policy integrity.** The proxy loads only a policy Decoyrail wrote or you blessed: an out-of-band edit to `policy.toml` fails closed, in every home, until a human reviews the diff and runs `decoyrail policy sign`. The refusal lands in the audit log as a tamper event.
 - **Exact spend metering.** Per-model token accounting parsed from provider
   `usage` fields (cache tokens at their own rates), priced from a built-in
   table with `pricing.json` overrides; byte-based estimates only where usage
   can't be parsed, labeled as estimates. Subscription traffic is detected and
   kept off the budget. A monthly budget and a kill switch deny requests once
   the budget is spent.
+- **Spend tripwire.** An agent stuck re-sending the same request, or burning tokens far past its own baseline, is blocked in minutes, not at the end of the month. Free, on by default, and sticky until `decoyrail trip clear`.
+
+  ![An agent stuck in a retry loop is caught by the spend tripwire while decoyrail log -t follows live, then cleared with decoyrail trip clear](docs/demos/spend-tripwire.gif)
+
+- **Waste report.** `decoyrail stats --waste` prices what was spent for nothing: retried identical requests, runaway loops, and repairable prompt-cache waste, in dollars, computed entirely from local state.
+- **Cost controls (Pro).** Budget soft-landing downgrades traffic to a cheaper model past a threshold you set instead of a dead stop, and model routing rewrites models per policy rule. Every rewrite is audited and marked, and no license state can ever block traffic.
 - **Sensitive-data filtering.** Request-side detectors for card numbers,
   SSNs, IBANs, bank routing numbers, and emails; block, mask, or warn per
   detector in policy. Audit events carry salted fingerprints, never the
@@ -118,9 +125,11 @@ troubleshooting) is in **[docs/getting-started.md](docs/getting-started.md)**.
 | `decoyrail run -- <cmd>` | Launch a command with decoys, proxy, and CA trust wired into its env. |
 | `decoyrail proxy` | Run the proxy standalone (point other apps at it). |
 | `decoyrail vault add/ls/rm` | Manage real secrets (where each is released shows in `ls`). |
-| `decoyrail policy show/path` | Inspect the egress policy. |
+| `decoyrail policy show/path/sign` | Inspect the egress policy; `sign` blesses a hand edit. |
 | `decoyrail log [-n N] [-t] [--pid P] [--verify]` | View, follow, filter, or verify the audit log. |
-| `decoyrail stats` | Spend, token, and security analytics over the audit log. |
+| `decoyrail stats [--waste]` | Spend, token, and security analytics; `--waste` prices what was wasted. |
+| `decoyrail trip [clear]` | Show a standing spend-tripwire trip, or clear it. |
+| `decoyrail plan [--price N]` | Declare your subscription plan price and compare it with API-equivalent usage. |
 | `decoyrail dlp show/set` | Configure the sensitive-data detectors. |
 | `decoyrail key status/migrate` | Choose where the vault key lives (file or macOS keychain). |
 | `decoyrail cache` | Prompt-cache hit rate and hygiene report. |
