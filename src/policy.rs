@@ -37,6 +37,12 @@ pub enum Action {
     /// secret. The middle posture between "deny what I haven't listed" and
     /// running unprotected; see plans/017.
     Warn,
+    /// Allow, plus rewrite the requested model per the rule's explicit
+    /// `route` map (plan 006, Pro). Policy-wise identical to allow — secret
+    /// release still rides `allow_secrets`, and deny/tripwire/DLP/budget
+    /// outrank it the same way — so no license state ever changes
+    /// reachability, only whether the rewrite happens.
+    Route,
     /// Defer to judge/human. Resolves to `escalate_fallback` until v0.5.
     Escalate,
 }
@@ -48,6 +54,7 @@ impl Action {
             Action::Allow => "allow",
             Action::Deny => "deny",
             Action::Warn => "warn",
+            Action::Route => "route",
             Action::Escalate => "escalate",
         }
     }
@@ -58,9 +65,10 @@ impl Action {
             "allow" => Ok(Action::Allow),
             "deny" => Ok(Action::Deny),
             "warn" => Ok(Action::Warn),
+            "route" => Ok(Action::Route),
             "escalate" => Ok(Action::Escalate),
             other => Err(anyhow::anyhow!(
-                "unknown action '{other}' (use allow|deny|warn|escalate)"
+                "unknown action '{other}' (use allow|deny|warn|route|escalate)"
             )),
         }
     }
@@ -80,9 +88,17 @@ pub struct Rule {
     pub action: Action,
     /// Secrets expected at destinations this rule matches: vault entry names,
     /// or provider labels as `provider:<label>`. Released (decoy swapped for
-    /// the real value) only when the rule resolves to allow.
+    /// the real value) only when the rule resolves to allow (or route, which
+    /// is allow plus a model rewrite).
     #[serde(default)]
     pub allow_secrets: Vec<String>,
+    /// Model map for `action = "route"` (plan 006): requested model to the
+    /// model that forwards. Explicit configuration, like the soft-landing
+    /// map — Decoyrail has no built-in opinions, and a request whose model
+    /// is absent, unmapped, or unidentifiable forwards unmodified. Ignored
+    /// on every other action.
+    #[serde(default)]
+    pub route: BTreeMap<String, String>,
 }
 
 /// Does an `allow_secrets` list cover this secret (by name or provider label)?
@@ -267,14 +283,18 @@ pub struct Decision {
     /// The winning rule's `allow_secrets`. Whether a listed secret is swapped
     /// or merely spared the tripwire depends on `action`.
     pub allow_secrets: Vec<String>,
+    /// The winning rule's model map (route rules only; empty otherwise).
+    pub route: BTreeMap<String, String>,
 }
 
 impl Decision {
     /// The winning rule releases this secret: swap decoy for real (transport
-    /// and location checks still apply). Only allow releases — a warn rule
-    /// forwards, but its listed secrets stay decoys.
+    /// and location checks still apply). Only allow — and route, which is
+    /// allow plus a model rewrite — releases; a warn rule forwards, but its
+    /// listed secrets stay decoys.
     pub fn releases(&self, secret: &Secret) -> bool {
-        self.action == Action::Allow && lists_secret(&self.allow_secrets, secret)
+        matches!(self.action, Action::Allow | Action::Route)
+            && lists_secret(&self.allow_secrets, secret)
     }
 
     /// The winning rule expects this secret here even though it is not
@@ -368,17 +388,35 @@ impl Policy {
     pub fn evaluate(&self, host: &str, path: &str, method: &str) -> Decision {
         for rule in &self.rules {
             if rule.matches(host, path, method) {
-                return self.resolve(rule.action, rule.name.clone(), rule.allow_secrets.clone());
+                return self.resolve(
+                    rule.action,
+                    rule.name.clone(),
+                    rule.allow_secrets.clone(),
+                    rule.route.clone(),
+                );
             }
         }
-        self.resolve(self.default_action, "default".into(), Vec::new())
+        self.resolve(
+            self.default_action,
+            "default".into(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
     }
 
-    fn resolve(&self, action: Action, rule: String, allow_secrets: Vec<String>) -> Decision {
+    fn resolve(
+        &self,
+        action: Action,
+        rule: String,
+        allow_secrets: Vec<String>,
+        route: BTreeMap<String, String>,
+    ) -> Decision {
         match action {
             Action::Escalate => Decision {
                 // A hand-edited fallback of "escalate" would otherwise resolve
-                // to an action the pipeline forwards; fail closed instead.
+                // to an action the pipeline forwards; fail closed instead. A
+                // fallback of "route" resolves like allow — the escalated
+                // rule has no map, so nothing ever rewrites through it.
                 action: match self.escalate_fallback {
                     Action::Escalate => Action::Deny,
                     other => other,
@@ -386,22 +424,27 @@ impl Policy {
                 rule,
                 escalated: true,
                 allow_secrets,
+                route,
             },
             other => Decision {
                 action: other,
                 rule,
                 escalated: false,
                 allow_secrets,
+                route,
             },
         }
     }
 
-    /// Rules that can release this secret (allow rules listing it), for
-    /// `vault ls` and the `decoyrail run` startup report.
+    /// Rules that can release this secret (allow and route rules listing
+    /// it), for `vault ls` and the `decoyrail run` startup report.
     pub fn releasing_rules(&self, secret: &Secret) -> Vec<&Rule> {
         self.rules
             .iter()
-            .filter(|r| r.action == Action::Allow && lists_secret(&r.allow_secrets, secret))
+            .filter(|r| {
+                matches!(r.action, Action::Allow | Action::Route)
+                    && lists_secret(&r.allow_secrets, secret)
+            })
             .collect()
     }
 
@@ -453,6 +496,35 @@ impl Policy {
         }
         warnings
     }
+
+    /// Non-blocking sanity warnings about route rules (plan 006): a route
+    /// rule whose map is empty never rewrites (it is just an allow; say so),
+    /// and a map targeting a model the pricing table doesn't price is likely
+    /// a typo the provider will reject — the same flag 003 raises on a
+    /// soft-landing target. Split from [`Self::lint`] because only these
+    /// warnings need the pricing table.
+    pub fn lint_routes(&self, pricing: &crate::pricing::Pricing) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for rule in self.rules.iter().filter(|r| r.action == Action::Route) {
+            if rule.route.is_empty() {
+                warnings.push(format!(
+                    "rule '{}': action is route but the route map is empty, so it \
+                     behaves exactly like allow and never rewrites",
+                    rule.name
+                ));
+            }
+            for to in rule.route.values() {
+                if !pricing.knows_model(to) {
+                    warnings.push(format!(
+                        "rule '{}': route target model '{to}' is not in the pricing \
+                         table (typo? requests forward as configured either way)",
+                        rule.name
+                    ));
+                }
+            }
+        }
+        warnings
+    }
 }
 
 /// Does the `outer` host glob match every host the `inner` glob matches?
@@ -481,10 +553,11 @@ pub const DEFAULT_POLICY_TOML: &str = r#"# Decoyrail default policy: "Claude Cod
 # On an allow rule the decoy is swapped for the real value; on a deny or
 # escalate rule the request blocks without raising the honeytoken alarm.
 #
-# Actions: allow | deny | warn | escalate. "warn" forwards like allow but
-# records a distinct warn event and never releases a secret; set it as the
+# Actions: allow | deny | warn | route | escalate. "warn" forwards like allow
+# but records a distinct warn event and never releases a secret; set it as the
 # default (or run `decoyrail run --watch`) to tune the policy against real
-# traffic without blocking the agent first.
+# traffic without blocking the agent first. "route" is allow plus a model
+# rewrite per the rule's explicit map (Pro; see the example near the end).
 default_action = "deny"
 escalate_fallback = "deny"
 
@@ -604,6 +677,18 @@ email = "off"    # email addresses; off because commits and packages carry them
 # keep_alive_max = 6        # cap pre-warms per prefix per session
 # serialize_fanout = true   # let one of N parallel requests write the cache, the rest read it
 # fanout_timeout_ms = 2000  # sibling wait cap so a stalled leader can't wedge them
+
+# Model router (Pro). A rule with action = "route" allows exactly like
+# "allow" (secrets still release via allow_secrets) and rewrites the requested
+# model per its explicit map; deny/tripwire/DLP/budget outrank it as they
+# outrank an allow. Every rewrite is audited (action: route) and marked on the
+# response (x-decoyrail-route); a model with no map entry forwards untouched.
+# [[rule]]
+# name = "anthropic-cheap-tier"
+# hosts = ["api.anthropic.com"]
+# action = "route"
+# allow_secrets = ["provider:anthropic"]
+# route = { "claude-opus-4" = "claude-sonnet-5" }
 
 # Budget soft-landing (Pro). Past threshold_pct of the monthly budget (set via
 # `decoyrail budget`), requests naming a model on the left are rewritten to
@@ -1122,6 +1207,121 @@ allow_secrets = ["svc"]
         assert!(!d.releases(&secret("svc", None)), "warn must never swap");
         assert!(d.expects(&secret("svc", None)), "but no honeytoken alarm");
         assert!(!d.expects(&secret("other", None)));
+    }
+
+    #[test]
+    fn route_parses_carries_map_and_releases_like_allow() {
+        assert_eq!(Action::parse("route").unwrap(), Action::Route);
+        assert_eq!(Action::parse("ROUTE").unwrap(), Action::Route);
+        assert_eq!(Action::Route.as_str(), "route");
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "routed"
+hosts = ["api.example.com"]
+action = "route"
+allow_secrets = ["svc"]
+route = { "claude-opus-4" = "claude-sonnet-5" }
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/v1/x", "POST");
+        assert_eq!(d.action, Action::Route);
+        assert_eq!(d.rule, "routed");
+        // The winning rule's map rides the decision for the pipeline.
+        assert_eq!(d.route["claude-opus-4"], "claude-sonnet-5");
+        // Policy-wise a route rule is an allow: it releases and expects its
+        // listed secrets exactly the same way.
+        assert!(d.releases(&secret("svc", None)));
+        assert!(d.expects(&secret("svc", None)));
+        assert!(!d.releases(&secret("other", None)));
+        assert_eq!(p.releasing_rules(&secret("svc", None)).len(), 1);
+        // A non-route decision carries no map.
+        let d = p.evaluate("evil.example.com", "/", "POST");
+        assert!(d.route.is_empty());
+    }
+
+    #[test]
+    fn deny_above_route_wins_and_route_map_defaults_empty() {
+        // First-match-wins gives deny/escalate precedence over a route rule
+        // with no new machinery, exactly as over an allow.
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "blocked"
+hosts = ["api.example.com"]
+path_prefixes = ["/blocked"]
+action = "deny"
+[[rule]]
+name = "routed"
+hosts = ["api.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonnet-5" }
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/blocked/x", "POST");
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.rule, "blocked");
+        assert_eq!(
+            p.evaluate("api.example.com", "/v1/x", "POST").action,
+            Action::Route
+        );
+        // A rule without the key parses with an empty map (every policy
+        // written before plan 006 keeps loading).
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[[rule]]\nname = \"r\"\n\
+             hosts = [\"x.example.com\"]\naction = \"route\"\n",
+        )
+        .unwrap();
+        assert!(p.rules[0].route.is_empty());
+    }
+
+    #[test]
+    fn lint_routes_flags_empty_maps_and_unpriced_targets() {
+        let pricing = crate::pricing::Pricing::default();
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "empty-map"
+hosts = ["a.example.com"]
+action = "route"
+[[rule]]
+name = "typo"
+hosts = ["b.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonet-5" }
+[[rule]]
+name = "fine"
+hosts = ["c.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonnet-5" }
+[[rule]]
+name = "not-a-route"
+hosts = ["d.example.com"]
+action = "allow"
+"#,
+        )
+        .unwrap();
+        let warnings = p.lint_routes(&pricing);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'empty-map'") && w.contains("empty")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'typo'") && w.contains("claude-sonet-5")),
+            "{warnings:?}"
+        );
+        // The shipped default (no route rules) lints route-clean.
+        assert!(policy().lint_routes(&pricing).is_empty());
     }
 
     #[test]

@@ -565,6 +565,45 @@ mod tests {
     }
 
     #[test]
+    fn add_and_set_accept_the_route_action() {
+        // `decoyrail policy add --action route` must not be rejected (plan
+        // 006); the map itself stays a file-edit workflow, so the added rule
+        // has an empty map until the user writes one.
+        let mut doc = PolicyDoc::parse(DEFAULT_POLICY_TOML).unwrap();
+        doc.add(
+            &edit("cheap-tier", "api.example.com", "route"),
+            &Anchor::End,
+        )
+        .unwrap();
+        let p = reparse(&doc);
+        let r = p.rules.iter().find(|r| r.name == "cheap-tier").unwrap();
+        assert_eq!(r.action, Action::Route);
+        assert!(r.route.is_empty());
+        // `set --action route` on an existing rule works the same way, and a
+        // hand-written map survives unrelated structured edits byte-for-byte.
+        let text = r#"
+default_action = "deny"
+[[rule]]
+name = "r"
+hosts = ["a.example.com"]
+action = "allow"
+route = { "claude-opus-4" = "claude-sonnet-5" }
+"#;
+        let mut doc = PolicyDoc::parse(text).unwrap();
+        doc.set(
+            "r",
+            &RuleEdit {
+                action: Some("route".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let p = reparse(&doc);
+        assert_eq!(p.rules[0].action, Action::Route);
+        assert_eq!(p.rules[0].route["claude-opus-4"], "claude-sonnet-5");
+    }
+
+    #[test]
     fn addressing_by_position_and_duplicate_names() {
         let text = r#"
 default_action = "deny"
