@@ -101,12 +101,12 @@ fn new_session_id() -> String {
 impl Engine {
     pub fn boot() -> Result<Self> {
         let ca = Arc::new(CertAuthority::load_or_create()?);
-        let vault = Arc::new(RwLock::new(Vault::load_or_init()?));
+        let vault = Vault::load_or_init()?;
         // Only a policy Decoyrail wrote or blessed loads. An unverifiable one
         // is a hard, instructive refusal to start; the refusal itself goes in
         // the tamper-evident log, not just stderr.
         let policy = match Policy::load_trusted() {
-            Ok(p) => Arc::new(RwLock::new(p)),
+            Ok(p) => p,
             Err(crate::policy::LoadError::Untrusted(msg)) => {
                 note_tamper_at_boot(&msg);
                 return Err(anyhow::anyhow!(msg));
@@ -114,16 +114,20 @@ impl Engine {
             Err(crate::policy::LoadError::Other(e)) => return Err(e),
         };
         let meter = Arc::new(Mutex::new(SessionMeter::load()?));
-        let pricing = Arc::new(RwLock::new(Pricing::load()?));
+        let pricing = Pricing::load()?;
         // Boot-time sanity pass over allow_secrets and route maps (see
-        // refresh() for the reload-time counterpart). try_read never fails on
-        // the locks we just created and works both inside and outside a
-        // tokio runtime.
-        if let (Ok(v), Ok(p), Ok(pr)) = (vault.try_read(), policy.try_read(), pricing.try_read()) {
-            for w in p.lint(&v.secrets).into_iter().chain(p.lint_routes(&pr)) {
-                eprintln!("decoyrail: policy warning: {w}");
-            }
+        // refresh() for the reload-time counterpart), before the values move
+        // behind their locks.
+        for w in policy
+            .lint(&vault.secrets)
+            .into_iter()
+            .chain(policy.lint_routes(&pricing))
+        {
+            eprintln!("decoyrail: policy warning: {w}");
         }
+        let vault = Arc::new(RwLock::new(vault));
+        let policy = Arc::new(RwLock::new(policy));
+        let pricing = Arc::new(RwLock::new(pricing));
         let auditor = Arc::new(Mutex::new(Auditor::open()?));
         let dlp_salt = crate::detect::load_or_create_salt()?;
         // Upstream client. No proxy (we ARE the proxy) — and explicitly so:

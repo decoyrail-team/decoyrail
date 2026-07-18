@@ -126,6 +126,16 @@ mod tests {
     }
 
     #[test]
+    fn model_span_guards_hold_on_their_own() {
+        // rewrite_model reaches model_span only after parse_model found a
+        // string model, so these defensive arms are pinned directly: a
+        // non-object root and a first-duplicate non-string value must both
+        // refuse a span rather than guess.
+        assert!(model_span(br#"["model","gpt-5"]"#).is_none());
+        assert!(model_span(br#"{"model":42}"#).is_none());
+    }
+
+    #[test]
     fn identity_mapping_is_a_no_op() {
         let m = map(&[("gpt-5", "gpt-5")]);
         assert!(rewrite_model(br#"{"model":"gpt-5"}"#, &m).is_none());

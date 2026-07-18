@@ -377,6 +377,19 @@ mod tests {
         }
     }
 
+    /// The rate fields when `sig` is a rate trip, `None` for anything else.
+    /// Both arms run below: the trip and the no-baseline burst.
+    fn rate_fields(sig: Option<Signal>) -> Option<(f64, f64, f64)> {
+        match sig {
+            Some(Signal::Rate {
+                window_usd,
+                per_min,
+                baseline_per_min,
+            }) => Some((window_usd, per_min, baseline_per_min)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn rate_spike_trips_only_past_floor_baseline_and_age() {
         let mut w = Watch::new(0, None);
@@ -389,23 +402,16 @@ mod tests {
         // Well past the floor inside the current window.
         w.observe_cost(now, c.rate_floor_usd * 2.0);
         let sig = w.observe(&c, now, "0000000000000001");
-        match sig {
-            Some(Signal::Rate {
-                window_usd,
-                per_min,
-                baseline_per_min,
-            }) => {
-                assert!(window_usd >= c.rate_floor_usd);
-                assert!(per_min > baseline_per_min * c.rate_multiplier);
-            }
-            other => panic!("expected a rate trip, got {other:?}"),
-        }
+        let (window_usd, per_min, baseline_per_min) =
+            rate_fields(sig).expect("expected a rate trip");
+        assert!(window_usd >= c.rate_floor_usd);
+        assert!(per_min > baseline_per_min * c.rate_multiplier);
 
         // The same burst without the age: a young session has no baseline.
         let mut young = Watch::new(0, None);
         young.observe_cost(10, 0.01);
         young.observe_cost(20, c.rate_floor_usd * 2.0);
-        assert_eq!(young.observe(&c, 30, "0000000000000002"), None);
+        assert_eq!(rate_fields(young.observe(&c, 30, "0000000000000002")), None);
 
         // Below the absolute floor: a spiky-but-cheap burst never trips.
         let mut cheap = Watch::new(0, None);
@@ -414,6 +420,18 @@ mod tests {
         }
         cheap.observe_cost(20 * 60, c.rate_floor_usd / 2.0);
         assert_eq!(cheap.observe(&c, 20 * 60, "0000000000000003"), None);
+    }
+
+    #[test]
+    fn non_positive_costs_never_enter_the_window() {
+        let mut w = Watch::new(0, None);
+        w.observe_cost(100, 0.0);
+        w.observe_cost(100, -0.5);
+        assert_eq!(w.session_spend, 0.0);
+        assert!(
+            w.costs.is_empty(),
+            "zero/negative costs must not accumulate"
+        );
     }
 
     #[test]

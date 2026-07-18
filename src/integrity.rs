@@ -330,6 +330,23 @@ mod tests {
     }
 
     #[test]
+    fn no_record_means_no_baseline() {
+        let (_g, _dir) = with_home();
+        assert!(baseline().unwrap().is_none());
+    }
+
+    #[test]
+    fn unappendable_audit_log_fails_install() {
+        let (_g, _dir) = with_home();
+        config::ensure_home().unwrap();
+        // A directory squatting where the audit log lives: the policy-change
+        // audit event cannot append, and install surfaces that instead of
+        // updating the policy silently off the record.
+        std::fs::create_dir(config::audit_path().unwrap()).unwrap();
+        assert!(install(DEFAULT_POLICY_TOML, "test").is_err());
+    }
+
+    #[test]
     fn baseline_self_authenticates() {
         let (_g, _dir) = with_home();
         install(DEFAULT_POLICY_TOML, "test").unwrap();

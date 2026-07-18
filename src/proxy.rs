@@ -1763,6 +1763,33 @@ mod tests {
         std::env::remove_var("DECOYRAIL_HOME");
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn keepalive_fire_respects_a_denying_policy() {
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+        crate::policy_edit::write_policy("default_action = \"deny\"\n", "test").unwrap();
+
+        let engine = Engine::boot().unwrap();
+        // Port 1 is unreachable on purpose: the deny must return before
+        // anything is sent, so nothing here needs a network.
+        let tmpl = crate::cache::KeepAliveTemplate {
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            port: 1,
+            headers: Vec::new(),
+            body: br#"{"model":"m","messages":[]}"#.to_vec(),
+        };
+        keepalive_fire(&engine, "api.example.com", "m", &tmpl).await;
+        let log = std::fs::read_to_string(crate::config::audit_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"keepalive\""),
+            "a denied destination must not pre-warm: {log}"
+        );
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
+
     #[test]
     fn parse_head_normalizes_connect_target() {
         let r = parse_head(b"CONNECT Api.Example.COM:8443 HTTP/1.1\r\n\r\n");
