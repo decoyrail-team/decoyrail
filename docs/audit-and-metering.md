@@ -325,6 +325,8 @@ map = { "claude-opus-4" = "claude-sonnet-5", "gpt-5" = "gpt-5-mini" }
 
 The map is yours. Decoyrail has no built-in opinion about which models are equivalent, and a model with no entry forwards untouched. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A request whose model can't be identified passes through unchanged; Decoyrail never guesses. A map that names a target model the pricing table doesn't know still forwards as configured (the provider errors informatively), and the audit note flags the likely typo.
 
+![Past the threshold, decoyrail status shows the degraded band and an opus request comes back rewritten to sonnet, marked with x-decoyrail-downgrade and audited](demos/soft-landing.gif)
+
 Downgrades never happen silently:
 
 - every rewritten request gets a `downgrade` audit event naming the mapping and the budget fraction that triggered it,
