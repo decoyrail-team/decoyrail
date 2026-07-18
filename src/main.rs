@@ -11,7 +11,7 @@ use std::io::Read;
 
 use decoyrail::stats::{fmt_bytes, fmt_tokens};
 use decoyrail::{
-    audit, ca, cache, config, engine, guard, meter, policy, pricing, proxy, util, vault,
+    audit, ca, cache, config, engine, guard, meter, policy, pricing, proxy, util, vault, watch,
 };
 
 use engine::Engine;
@@ -64,8 +64,19 @@ enum Command {
     Budget { usd: f64 },
     /// Declare what your subscription plan costs, or show what it absorbed.
     Plan(PlanArgs),
+    /// Show the spend tripwire state, or clear a trip.
+    Trip {
+        #[command(subcommand)]
+        cmd: Option<TripCmd>,
+    },
     /// Remove Decoyrail's trusted CA, keychain item, and local state.
     Uninstall(UninstallArgs),
+}
+
+#[derive(Subcommand)]
+enum TripCmd {
+    /// Clear the trip: LLM traffic resumes and detection starts fresh.
+    Clear,
 }
 
 #[derive(Args)]
@@ -419,6 +430,7 @@ fn main() -> Result<()> {
         Command::Cache => cache_cmd(),
         Command::Budget { usd } => budget_cmd(usd),
         Command::Plan(args) => plan_cmd(args),
+        Command::Trip { cmd } => trip_cmd(cmd),
         Command::Uninstall(a) => uninstall_cmd(a),
     }
 }
@@ -1735,7 +1747,9 @@ fn print_audit_line(line: &str) {
     // alarm: someone or something edited the release gate out-of-band.
     let flag = if ev.action == "tamper" {
         "[TAMP]"
-    } else if !ev.tripwires.is_empty() {
+    } else if !ev.tripwires.is_empty() || ev.note.starts_with("spend tripwire") {
+        // The spend tripwire (plan 002) earns the same prominence as the
+        // honeytoken alarm: both are tripwires, one on secrets, one on cost.
         "[TRIP]"
     } else if ev.action == "deny" {
         "[DENY]"
@@ -1955,6 +1969,22 @@ fn status_cmd() -> Result<()> {
                 "  SOFT-LANDING: spend at {pct:.0}% of budget; mapped models are being downgraded"
             );
         }
+    }
+    // Spend tripwire (plan 002): a standing trip is front-page news, with
+    // the clear path right next to it.
+    if let Ok(Some(trip)) = watch::load_trip() {
+        let blocking = policy::Policy::load_or_default()
+            .map(|p| p.spend_tripwire.mode == policy::TripwireMode::Block)
+            .unwrap_or(true);
+        println!(
+            "  SPEND TRIPWIRE: {}: {}. Clear with `decoyrail trip clear`.",
+            if blocking {
+                "tripped; LLM traffic is blocked"
+            } else {
+                "tripped (alert mode: traffic still flows)"
+            },
+            trip.reason
+        );
     }
     // Model router (plan 006): the policy's active route rules, so redirected
     // traffic is inspectable at a glance. Without a Pro license the rules are
@@ -2239,6 +2269,55 @@ fn print_hygiene(s: &cache::KeyStats, waste: Option<(f64, bool)>) {
 /// Declare, show, or clear the local plan price (plan 019). Bare `decoyrail
 /// plan` reads this period's plan-absorbed total against the declared price;
 /// the price is one local setting the user owns, never guessed.
+fn trip_cmd(cmd: Option<TripCmd>) -> Result<()> {
+    match cmd {
+        None => match watch::load_trip()? {
+            None => println!("Spend tripwire: clear (no trip in force)."),
+            Some(t) => {
+                let when = if t.ts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at {}", t.ts)
+                };
+                println!("Spend tripwire: TRIPPED{when}");
+                println!("  {}", t.reason);
+                if !t.sid.is_empty() {
+                    println!("  tripped by session: {}", t.sid);
+                }
+                let mode = policy::Policy::load_or_default()
+                    .map(|p| p.spend_tripwire.mode)
+                    .unwrap_or(policy::TripwireMode::Block);
+                match mode {
+                    policy::TripwireMode::Block => {
+                        println!("  LLM-bound traffic is blocked while the trip stands.")
+                    }
+                    _ => println!(
+                        "  Traffic still flows (policy mode is not \"block\"); \
+                         the trip is on record."
+                    ),
+                }
+                println!("  Clear with `decoyrail trip clear`.");
+            }
+        },
+        Some(TripCmd::Clear) => {
+            if watch::load_trip()?.is_none() {
+                println!("No spend trip to clear.");
+                return Ok(());
+            }
+            watch::clear_trip()?;
+            // Clearing an enforcement state is audit-worthy news, same as
+            // setting one: the log should show who turned the alarm off.
+            let mut a = audit::Auditor::open()?;
+            a.append(
+                audit::Entry::note("trip", "spend tripwire cleared by operator".into()),
+                util::now_rfc3339(),
+            )?;
+            println!("Spend trip cleared; LLM traffic resumes.");
+        }
+    }
+    Ok(())
+}
+
 fn plan_cmd(args: PlanArgs) -> Result<()> {
     if args.clear {
         meter::clear_plan_price()?;

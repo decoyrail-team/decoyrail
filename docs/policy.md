@@ -37,6 +37,13 @@ aba = "warn"
 email = "off"
 # allow = ["4111 1111 1111 1111"]      # fixture values the detectors ignore
 # debug = true                         # dump hit payloads for inspection
+
+[spend_tripwire]                       # runaway-loop breaker (on by default)
+mode = "block"                         # block | alert | off
+repeats = 15                           # identical requests in the window that trip
+window_secs = 300                      # sliding window for both detectors
+rate_multiplier = 10.0                 # spend rate vs the session baseline; 0 = off
+rate_floor_usd = 5.0                   # and at least this many dollars in the window
 ```
 
 ## Evaluation: top to bottom, first match wins
@@ -352,6 +359,9 @@ Policy is necessary but not sufficient for a request to leave:
   or warned host.
 - An **exhausted budget** denies everything until the month rolls over or
   the budget is raised.
+- A **[spend tripwire](audit-and-metering.md#the-spend-tripwire) trip**
+  denies LLM-bound traffic (in `block` mode) until an explicit
+  `decoyrail trip clear`; non-LLM egress keeps flowing.
 - An **allow** without `allow_secrets` does not swap anything: the host is
   reachable, but every credential stays a decoy. The swap additionally
   requires TLS transport and the right

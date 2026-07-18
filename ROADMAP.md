@@ -67,10 +67,11 @@ automatic fixes are the paid tier.
   API-equivalent rates, so you can see what your plan absorbed this month,
   how close you are to outgrowing it, and what your waste costs in the
   currency that matters on a plan: headroom.
-- **Spend tripwire** (free): an agent stuck re-sending the same request, or
-  burning tokens far faster than its own baseline, gets caught in minutes,
-  not at the end of the month. Alert or block, your choice, and the block
-  explains itself so the agent can break its own loop.
+- **Spend tripwire** (free, shipped): an agent stuck re-sending the same
+  request, or burning tokens far faster than its own baseline, gets caught
+  in minutes, not at the end of the month. Alert or block, your choice, and
+  the block explains itself so the agent can break its own loop. Clearing a
+  trip is an explicit command (`decoyrail trip clear`), never a timeout.
 - **Budget soft-landing**: past a threshold you set, traffic downgrades to a
   cheaper model instead of stopping. The kill switch stays for the hard
   limit. Every downgrade is audited and visible; nothing is ever silent.

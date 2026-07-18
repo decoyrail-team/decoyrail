@@ -72,6 +72,11 @@ verdicts, the one recorded write path (`install`), blessing
 `audit.rs` hash-chained, lock-serialized, head-anchored tamper-evident log ·
 `meter.rs` spend metering + budget + subscription reference cost and the
 declared plan price/verdict (`decoyrail plan`, plan 019) ·
+`watch.rs` spend tripwire (plan 002): salted request fingerprints (also
+stamped on LLM request audit events as `fp`), repeat/rate runaway detectors
+per the policy's `[spend_tripwire]` table, trip persistence in `trip.json`
+(cleared only by `decoyrail trip clear`; free tier, blocks LLM-bound traffic
+only) ·
 `softland.rs` budget soft-landing (plan 003): byte-surgical model downgrade
 per the policy's `[soft_landing]` map, applied by the pipeline in the band
 between `threshold_pct` of the budget and the kill switch (Pro-gated,

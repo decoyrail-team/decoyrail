@@ -283,6 +283,32 @@ How it behaves:
   frequent usage writes can never clobber a budget you set while it was
   running. Both hot-reload into a running proxy.
 
+## The spend tripwire
+
+The monthly budget is a backstop, and it fires far too late for an agent that got stuck at 2am retrying the same failing request. The spend tripwire watches for runaway behavior in near real time and trips in minutes, not at the end of the month. It is a safety feature, so it ships in the free tier, on by default, and no license state affects it.
+
+Two purely mechanical signals, no guessing about intent:
+
+- **Repetition:** the same request (same destination, method, and body) seen `repeats` times inside the sliding window. Fifteen byte-identical LLM calls in five minutes is a loop, not a retry.
+- **Rate:** the window's metered spend far above the session's own earlier pace, past both a multiplier and an absolute dollar floor. A young session has no baseline yet and cannot rate-trip; the repeat detector and the kill switch still stand.
+
+It is configured in the policy's `[spend_tripwire]` table (hot-reloaded like the rest), shown here with its defaults:
+
+```toml
+[spend_tripwire]
+mode = "block"          # block | alert | off
+repeats = 15
+window_secs = 300
+rate_multiplier = 10.0  # 0 disables rate detection
+rate_floor_usd = 5.0
+```
+
+Only LLM-bound traffic (hosts the pricing table maps to a provider) is watched and, on a trip, blocked; `git push` and `cargo fetch` keep flowing. In `block` mode the tripping request and everything LLM-bound after it get a 403 whose JSON body names the trigger, the counts, and the clear command, so a coding agent can read why its requests stopped and break its own loop. In `alert` mode the trip is recorded once and traffic keeps forwarding: visibility before enforcement, same as the DLP detectors' warn posture.
+
+A trip is deliberately sticky. It persists to `trip.json`, survives a proxy restart, reaches every session sharing the state dir, and also stops Pro keep-alive pre-warms (quiet recurring spend is exactly what a tripped session must not keep accruing). Nothing clears it but an operator: `decoyrail trip` shows the trip and `decoyrail trip clear` clears it, resets detection state, and writes its own audit event. `decoyrail status` puts a standing trip on the front page, and `decoyrail log -t` renders the events with `[TRIP]` prominence, same as the honeytoken alarm: both are tripwires, one on secrets, one on cost.
+
+The audit events carry a salted fingerprint of the repeated request and the counts, never request content, exactly like DLP hits. If your agent legitimately polls one endpoint with identical bodies, raise `repeats` or widen `window_secs` for your traffic; the defaults are chosen so ordinary retry-with-backoff never gets close.
+
 ## Budget soft-landing (Pro)
 
 The kill switch is binary: under budget everything flows, at 100% everything stops. Soft-landing adds a band in between. Past a threshold you set, requests that name a model in your downgrade map are rewritten to the cheaper model, so the agent keeps working at lower cost instead of hitting the wall at speed. At 100% the kill switch still stops everything, exactly as above.
