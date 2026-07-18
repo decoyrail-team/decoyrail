@@ -140,12 +140,8 @@ pub fn report(window: &Window) -> Result<WasteReport> {
     let mut reqs: Vec<Req> = Vec::new();
     let mut by_seq: BTreeMap<u64, usize> = BTreeMap::new();
     let mut blocked_by_fp: BTreeMap<String, u64> = BTreeMap::new();
-    let path = config::audit_path()?;
-    let text = if path.exists() {
-        std::fs::read_to_string(&path)?
-    } else {
-        String::new()
-    };
+    // A missing or unreadable log is an empty window, not a failed report.
+    let text = std::fs::read_to_string(config::audit_path()?).unwrap_or_default();
     for line in text.lines() {
         let Ok(ev) = serde_json::from_str::<AuditEvent>(line) else {
             continue;
@@ -475,12 +471,21 @@ mod tests {
         deny.action = "deny".into();
         deny.note = "spend tripwire: identical request repeated 3x in 300s".into();
         a.append(deny, ts(50)).unwrap();
+        // A fingerprinted deny for another reason is not a blocked repeat,
+        // and a fingerprint-less deny (ordinary policy block) is invisible.
+        let mut other_deny = request(fp_loop, None);
+        other_deny.action = "deny".into();
+        other_deny.note = "budget exhausted".into();
+        a.append(other_deny, ts(51)).unwrap();
+        let mut plain_deny = request(fp_loop, None);
+        plain_deny.action = "deny".into();
+        plain_deny.fp = None;
+        a.append(plain_deny, ts(52)).unwrap();
         // A streamed pair: the re-send's cost arrives via a usage event.
         let streamed = a.append(request(fp_stream, None), ts(60)).unwrap();
         a.append(request(fp_stream, None), ts(70)).unwrap();
         let follow = a.append(request(fp_stream, None), ts(80)).unwrap();
         let mut u = Entry {
-            action: "usage".into(),
             usage: Some(usage(0.08, 0.0)),
             req_seq: Some(follow.seq),
             ..Entry::note("usage", String::new())
@@ -489,6 +494,29 @@ mod tests {
         a.append(u, ts(81)).unwrap();
         // The first streamed request's own usage event, linking nothing new.
         let _ = streamed;
+        // Usage events the grouper must skip without effect: one for a
+        // request outside the window's map (a pre-restart seq), one with no
+        // req_seq at all (a non-LLM stream's byte accounting).
+        let mut orphan = Entry {
+            usage: Some(usage(9.99, 0.0)),
+            req_seq: Some(999_999),
+            ..Entry::note("usage", String::new())
+        };
+        orphan.action = "usage".into();
+        a.append(orphan, ts(82)).unwrap();
+        let mut bare = Entry::note("usage", String::new());
+        bare.action = "usage".into();
+        a.append(bare, ts(83)).unwrap();
+        // And a corrupt line: the report reads best-effort, the chain
+        // verifier is the one that cares.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(crate::config::audit_path().unwrap())
+                .unwrap();
+            writeln!(f, "not json at all").unwrap();
+        }
 
         let r = report(&Window::All).unwrap();
         assert_eq!(r.gap_secs, 300);
@@ -565,11 +593,18 @@ mod tests {
         let key_stats = r#"{"requests": 8, "marked": 0, "preserved": 6, "ttl_gaps": 0,
             "resets": 1, "diverged": 0, "below_min": 0,
             "repairable": 6, "repairable_bytes": 4000000, "repaired": 0}"#;
+        // A malformed key (no host/model split) and a zero-bytes key must
+        // both be skipped without pricing anything.
         std::fs::write(
             crate::config::cache_path().unwrap(),
             format!(
-                r#"{{"period": "{}", "per_key": {{"api.anthropic.com claude-sonnet-5": {key_stats}}}}}"#,
-                crate::util::current_period()
+                r#"{{"period": "{p}", "per_key": {{
+                    "api.anthropic.com claude-sonnet-5": {key_stats},
+                    "malformed-key-no-space": {key_stats},
+                    "api.anthropic.com claude-opus-4": {{"requests": 1, "marked": 0,
+                        "preserved": 0, "ttl_gaps": 0, "resets": 0, "diverged": 0,
+                        "below_min": 0, "repairable": 0, "repairable_bytes": 0}}}}}}"#,
+                p = crate::util::current_period()
             ),
         )
         .unwrap();
