@@ -336,15 +336,15 @@ const MATRIX = [
     ['Sensitive-data detectors (cards, SSNs, bank ids)', [true, true, true, true]],
     ['Tamper-evident audit log with live tail', [true, true, true, true]],
     ['TLS interception with a per-device CA', [true, true, true, true]],
-    ['Spend tripwire (runaway loops caught in minutes)', ['v0.3', 'v0.3', 'v0.3', 'v0.3']],
+    ['Spend tripwire (runaway loops caught in minutes)', [true, true, true, true]],
   ]},
   { group: 'Cost', intro: 'The free tier measures the waste with exact numbers; the paid tiers fix it automatically.', rows: [
     ['Exact per-model token metering', [true, true, true, true]],
     ['Monthly budget and kill switch', [true, true, true, true]],
-    ['The waste report, in dollars, with causes', ['v0.3', 'v0.3', 'v0.3', 'v0.3']],
-    ['Budget soft-landing (downgrade, not dead stop)', ['', 'v0.3', 'v0.3', 'v0.3']],
-    ['Prompt-cache repair and keep-alive', ['', 'v0.3', 'v0.3', 'v0.3']],
-    ['Model routing by policy', ['', 'v0.3', 'v0.3', 'v0.3']],
+    ['The waste report, in dollars, with causes', [true, true, true, true]],
+    ['Budget soft-landing (downgrade, not dead stop)', ['', true, true, true]],
+    ['Prompt-cache repair and keep-alive', ['', true, true, true]],
+    ['Model routing by policy', ['', true, true, true]],
   ]},
   { group: 'Fleet', intro: 'One pane of glass once agents run on more machines than yours.', rows: [
     ['Admin console with policy dry-run', ['', '', 'v0.4', 'v0.4']],
@@ -498,10 +498,11 @@ const FAQ = [
     <a href="https://fsl.software">FSL-1.1-ALv2</a> (each release becomes
     Apache-2.0 after two years), so your security team can read and build
     the exact code that holds your keys.`],
-  ['When can I buy Pro?',
-   `The cost pack ships in v0.3 (see the <a href="docs/roadmap">roadmap</a>),
-    and Pro goes on sale when the features on this page are real, not
-    before. Email us and we will let you know the moment it is live.`],
+  ['How do I buy Pro?',
+   `Email us. Everything Pro lists on this page shipped in v0.3, so Pro is
+    on sale now at launch pricing. You get an offline license file back,
+    <code>decoyrail license install</code> it, and you are done: no account,
+    no activation, no phone-home.`],
   ['Can I cancel?',
    `Any time. The term you paid for runs out, then the product downgrades
     itself to the free tier, gracefully. There is nothing to uninstall and
@@ -538,7 +539,7 @@ ${topnav('./')}
 
 <section class="compare">
   <h2>Compare the tiers</h2>
-  <p class="note">A version tag (<span class="tag">v0.3</span>) marks a
+  <p class="note">A version tag (<span class="tag">v0.4</span>) marks a
   feature on the public <a href="docs/roadmap">roadmap</a> that has not
   shipped yet. Everything untagged works today. We would rather show you the
   tags than sell you a checkmark.</p>
