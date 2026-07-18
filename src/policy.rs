@@ -23,6 +23,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config;
 use crate::vault::{glob_match, Secret, PROVIDER_LABELS};
@@ -213,6 +214,31 @@ impl Default for CacheConfig {
     }
 }
 
+/// Budget soft-landing (plan 003): the band between a configurable share of
+/// the monthly budget and the hard limit. Inside it, requests naming a model
+/// on the left of `map` are rewritten to the cheaper model on the right; at
+/// 100% the kill switch still stops everything, unchanged. Off by default
+/// (no threshold, no map), Pro-gated at its entry point in the pipeline, and
+/// hot-reloaded like the rest of the policy. Mirrors `[soft_landing]` in the
+/// policy file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoftLandingConfig {
+    /// Percent of the monthly budget where downgrades begin. 0 disables.
+    pub threshold_pct: f64,
+    /// Explicit downgrade map, requested model to cheaper model. The map is
+    /// the customer's opinion of "equivalent"; Decoyrail has none built in,
+    /// and a model with no entry forwards untouched.
+    pub map: BTreeMap<String, String>,
+}
+
+impl SoftLandingConfig {
+    /// Configured on: a positive threshold and at least one mapping.
+    pub fn enabled(&self) -> bool {
+        self.threshold_pct > 0.0 && !self.map.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub default_action: Action,
@@ -224,6 +250,8 @@ pub struct Policy {
     pub dlp: DlpConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub soft_landing: SoftLandingConfig,
 }
 
 fn default_escalate_fallback() -> Action {
@@ -576,6 +604,16 @@ email = "off"    # email addresses; off because commits and packages carry them
 # keep_alive_max = 6        # cap pre-warms per prefix per session
 # serialize_fanout = true   # let one of N parallel requests write the cache, the rest read it
 # fanout_timeout_ms = 2000  # sibling wait cap so a stalled leader can't wedge them
+
+# Budget soft-landing (Pro). Past threshold_pct of the monthly budget (set via
+# `decoyrail budget`), requests naming a model on the left are rewritten to
+# the cheaper model on the right; at 100% the kill switch still stops
+# everything. Every downgrade is audited, marked on the response
+# (x-decoyrail-downgrade), and invalidates the provider prompt cache (caches
+# are model-scoped). Off by default.
+# [soft_landing]
+# threshold_pct = 80
+# map = { "claude-opus-4" = "claude-sonnet-5" }
 "#;
 
 #[cfg(test)]
@@ -910,6 +948,38 @@ debug = true
         assert!(!p.cache.repair);
         assert!(!p.cache.keep_alive);
         assert!(!p.cache.serialize_fanout);
+        assert!(!p.soft_landing.enabled());
+    }
+
+    #[test]
+    fn soft_landing_defaults_off_and_parses_overrides() {
+        // Absent section (including every policy written before it existed):
+        // off, nothing rewrites.
+        let p: Policy = toml::from_str("default_action = \"deny\"").unwrap();
+        assert!(!p.soft_landing.enabled());
+        assert_eq!(p.soft_landing.threshold_pct, 0.0);
+        assert!(p.soft_landing.map.is_empty());
+
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[soft_landing]\nthreshold_pct = 80\n\
+             map = { \"claude-opus-4\" = \"claude-sonnet-5\", \"gpt-5\" = \"gpt-5-mini\" }\n",
+        )
+        .unwrap();
+        assert!(p.soft_landing.enabled());
+        assert_eq!(p.soft_landing.threshold_pct, 80.0);
+        assert_eq!(p.soft_landing.map["claude-opus-4"], "claude-sonnet-5");
+        assert_eq!(p.soft_landing.map["gpt-5"], "gpt-5-mini");
+
+        // A threshold without a map (or a map without a threshold) stays off:
+        // both halves are explicit opt-ins.
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[soft_landing]\nthreshold_pct = 80\n")
+                .unwrap();
+        assert!(!p.soft_landing.enabled());
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[soft_landing]\nmap = { \"a\" = \"b\" }\n")
+                .unwrap();
+        assert!(!p.soft_landing.enabled());
     }
 
     #[test]

@@ -1913,6 +1913,26 @@ fn status_cmd() -> Result<()> {
     }
     if meter.over_budget() {
         println!("  BUDGET EXHAUSTED: requests are being denied");
+    } else if meter.budget_usd > 0.0 {
+        // Soft-landing band (plan 003): the session is degraded, say so. The
+        // line appears only when downgrades actually happen, which needs the
+        // policy's [soft_landing] table and a Pro tier.
+        let pct = meter.total_cost().max(0.0) / meter.budget_usd * 100.0;
+        let configured = policy::Policy::load_or_default()
+            .map(|p| p.soft_landing.enabled() && pct >= p.soft_landing.threshold_pct)
+            .unwrap_or(false);
+        let pro = decoyrail::license::load_installed()
+            .ok()
+            .flatten()
+            .is_some_and(|doc| {
+                decoyrail::license::effective_tier(&doc, chrono::Utc::now().date_naive())
+                    >= decoyrail::license::Tier::Pro
+            });
+        if configured && pro {
+            println!(
+                "  SOFT-LANDING: spend at {pct:.0}% of budget; mapped models are being downgraded"
+            );
+        }
     }
     // Reference dollars are their own labeled line, never a share of Spend,
     // and the budget above never sees them.

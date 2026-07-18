@@ -328,6 +328,19 @@ impl SessionMeter {
         self.budget_usd > 0.0 && self.merged_cost + self.delta.total_cost() >= self.budget_usd
     }
 
+    /// Percent of the monthly budget spent, over the same global view as
+    /// `over_budget`; `None` when no budget is set. The soft-landing band
+    /// check (plan 003) reads this. Only billable dollars count: subscription
+    /// traffic's reference cost never reaches `total_cost`, so it can neither
+    /// trip the kill switch nor push a session into the degraded band.
+    pub fn budget_used_pct(&mut self, now_period: &str) -> Option<f64> {
+        self.roll(now_period);
+        if self.budget_usd <= 0.0 {
+            return None;
+        }
+        Some((self.merged_cost + self.delta.total_cost()) / self.budget_usd * 100.0)
+    }
+
     /// True if meter.json changed on disk since we last read or wrote it,
     /// i.e. another decoyrail process flushed usage.
     pub fn stale(&self, disk_mtime: Option<SystemTime>) -> bool {
@@ -719,6 +732,39 @@ mod tests {
             50.0,
         );
         assert!(v.starts_with("plan ("), "{v}");
+    }
+
+    #[test]
+    fn budget_used_pct_tracks_global_spend_or_stays_none() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // No budget set: no percentage, so the soft-landing band can never
+        // engage on an unlimited meter.
+        let mut m = SessionMeter::load().unwrap();
+        m.record("2026-07", "api.anthropic.com", 100_000, 100_000);
+        assert_eq!(m.budget_used_pct("2026-07"), None);
+
+        // With a budget, the fraction covers merged spend plus the local
+        // delta, exactly like the kill switch's view.
+        save_budget(1.0).unwrap();
+        let mut a = SessionMeter::load().unwrap();
+        let mut da = Meter::default();
+        da.roll_period("2026-07");
+        // 200k bytes of Anthropic traffic estimate to 0.45 at $9/mtok.
+        a.record("2026-07", "api.anthropic.com", 100_000, 100_000);
+        da.record("api.anthropic.com", 100_000, 100_000);
+        let expect = da.total_cost() * 100.0;
+        let pct = a.budget_used_pct("2026-07").unwrap();
+        assert!((pct - expect).abs() < 1e-9, "pct {pct} vs {expect}");
+        assert!(pct > 0.0 && pct < 100.0);
+        assert!(!a.over_budget("2026-07"));
+
+        // A month rollover resets the band along with the spend.
+        assert_eq!(a.budget_used_pct("2026-08"), Some(0.0));
+
+        std::env::remove_var("DECOYRAIL_HOME");
     }
 
     #[test]

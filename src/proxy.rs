@@ -215,23 +215,25 @@ async fn pipeline_inner(
     engine.refresh().await;
 
     // 1. Policy decision on destination (and the DLP detector modes plus the
-    //    prompt-cache knobs, read under the same lock so one request sees one
-    //    consistent policy).
-    let (decision, dlp_cfg, cache_cfg) = {
+    //    prompt-cache and soft-landing knobs, read under the same lock so one
+    //    request sees one consistent policy).
+    let (decision, dlp_cfg, cache_cfg, soft_cfg) = {
         let policy = engine.policy.read().await;
         (
             policy.evaluate(host, &path, &method),
             policy.dlp.clone(),
             policy.cache.clone(),
+            policy.soft_landing.clone(),
         )
     };
 
-    // 2. Budget kill switch (global: merged spend from all sessions plus ours).
-    let over_budget = engine
-        .meter
-        .lock()
-        .await
-        .over_budget(&crate::util::current_period());
+    // 2. Budget kill switch (global: merged spend from all sessions plus
+    //    ours), and the spend fraction the soft-landing band check reads.
+    let (over_budget, budget_pct) = {
+        let mut meter = engine.meter.lock().await;
+        let now = crate::util::current_period();
+        (meter.over_budget(&now), meter.budget_used_pct(&now))
+    };
 
     // 3. Buffer the request body (prompts are small; enables body swap),
     //    bounded so a runaway client can't exhaust proxy memory.
@@ -265,6 +267,60 @@ async fn pipeline_inner(
         Err(e) => return Err(anyhow!("reading request body: {e}")),
     };
 
+    // 3.4. Budget soft-landing (plan 003, Pro + policy opt-in): in the band
+    //      between the policy's threshold and the hard limit, rewrite the
+    //      requested model to the cheaper one the downgrade map names. Runs
+    //      before the doctor, the accounting parse, and the swap, so every
+    //      later step sees exactly the body that forwards; at 100% the kill
+    //      switch below still denies, unchanged. The tier read gates only
+    //      this paid convenience, never a security verb — with no Pro
+    //      license, no configured table, or no mapped model, the bytes pass
+    //      through untouched and only the hard limit remains. Subscription
+    //      traffic never feeds the band: `budget_used_pct` counts billable
+    //      dollars only. The downgrade is never silent: an audit event here,
+    //      a response header below.
+    let provider = engine.pricing.read().await.provider_for_host(host);
+    let mut downgrade_header: Option<String> = None;
+    if soft_cfg.enabled()
+        && provider.is_some()
+        && !over_budget
+        && matches!(decision.action, Action::Allow | Action::Warn)
+        && budget_pct.is_some_and(|pct| pct >= soft_cfg.threshold_pct)
+        && engine.tier().await >= crate::license::Tier::Pro
+    {
+        if let Some(rw) = crate::softland::rewrite_model(&body_bytes, &soft_cfg.map) {
+            body_bytes = rw.body;
+            let pct = budget_pct.unwrap_or(0.0);
+            // A model rewrite invalidates the provider's prompt cache (caches
+            // are model-scoped), so the note says so and the cost math stays
+            // honest. A target model the pricing table doesn't know forwards
+            // as configured (the provider errors informatively) but is
+            // flagged: it is likely a typo in the map.
+            let mut note = format!(
+                "budget soft-landing: model {} -> {} at {pct:.0}% of budget; \
+                 provider prompt cache invalidated (caches are model-scoped)",
+                rw.from, rw.to
+            );
+            if !engine.pricing.read().await.knows_model(&rw.to) {
+                note.push_str("; target model not in the pricing table");
+            }
+            downgrade_header = Some(format!("{} -> {}", rw.from, rw.to));
+            audit(
+                engine,
+                Entry {
+                    host: host.into(),
+                    path: path.clone(),
+                    method: method.clone(),
+                    action: "downgrade".into(),
+                    rule: decision.rule.clone(),
+                    note,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    }
+
     // 3.5. Prompt-cache doctor (observe-only, plan 004): diagnose cache
     //      hygiene on the pre-swap body, so nothing the doctor keeps ever
     //      derives from a real secret. Anthropic protocol only (OpenAI's
@@ -274,7 +330,6 @@ async fn pipeline_inner(
     //      Tripwire/DLP overrides below aren't known yet; both are rare on a
     //      provider-bound request and cost one noisy comparison, not a
     //      mutation. The parsed model is reused by the accounting step.
-    let provider = engine.pricing.read().await.provider_for_host(host);
     let cache_active = provider == Some(crate::pricing::Provider::Anthropic)
         && decision.action == Action::Allow
         && !over_budget;
@@ -579,6 +634,11 @@ async fn pipeline_inner(
     // (SPEC invariant): the client sees exactly what the proxy changed.
     if let Some(h) = &cache_header {
         builder = builder.header("x-decoyrail-cache", h.as_str());
+    }
+    // Same rule for a soft-landing downgrade (plan 003): degraded traffic
+    // announces itself, so silent quality loss can't erode trust.
+    if let Some(h) = &downgrade_header {
+        builder = builder.header("x-decoyrail-downgrade", h.as_str());
     }
 
     // SSE streams pass through untouched (latency-critical). Every other

@@ -210,6 +210,16 @@ impl Pricing {
             .unwrap_or_else(|| provider.default_rate())
     }
 
+    /// Is `model` covered by the pricing table (any prefix entry matches)?
+    /// The soft-landing downgrade (plan 003) uses this to flag a map naming
+    /// a model nothing prices — likely a typo the provider will reject. The
+    /// request forwards as configured either way; this only shapes the log.
+    pub fn knows_model(&self, model: &str) -> bool {
+        self.models
+            .keys()
+            .any(|prefix| model.starts_with(prefix.as_str()))
+    }
+
     /// How this request is billed. An explicit `pricing.json` override wins;
     /// otherwise Anthropic requests authenticated with OAuth (`Authorization:
     /// Bearer`, no `x-api-key`) are Claude-plan subscription traffic, and
@@ -444,6 +454,15 @@ mod tests {
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn knows_model_matches_prefixes_only() {
+        let p = Pricing::default();
+        assert!(p.knows_model("claude-sonnet-5"));
+        assert!(p.knows_model("claude-sonnet-5-20250929"), "dated release");
+        assert!(!p.knows_model("totally-unknown-model"));
+        assert!(!p.knows_model(""));
     }
 
     #[test]
