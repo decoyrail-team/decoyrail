@@ -547,7 +547,10 @@ impl Window {
 
     /// Half-open [from, to) bounds as UTC hour keys. Local midnights convert
     /// to UTC, so "today" means the user's day, not the server's.
-    fn bounds(&self, now: chrono::DateTime<chrono::Local>) -> (Option<String>, Option<String>) {
+    pub(crate) fn bounds(
+        &self,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> (Option<String>, Option<String>) {
         use chrono::{Datelike, Duration, NaiveDate};
         let today = now.date_naive();
         let (from, to) = match self {

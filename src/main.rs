@@ -410,6 +410,10 @@ struct StatsArgs {
     /// Print today's embeddable one-line summary. Ignores window options.
     #[arg(long)]
     line: bool,
+    /// Print the waste report: dollars identifiably wasted in the window
+    /// (retries, runaway loops, prompt-cache misses) and why.
+    #[arg(long, conflicts_with = "line")]
+    waste: bool,
 }
 
 fn main() -> Result<()> {
@@ -1812,6 +1816,16 @@ fn stats_cmd(args: StatsArgs) -> Result<()> {
         "day" => Breakdown::Day,
         other => return Err(anyhow!("bad --by '{other}' (use session|model|host|day)")),
     };
+
+    if args.waste {
+        let report = decoyrail::waste::report(&window)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", decoyrail::waste::render(&report));
+        }
+        return Ok(());
+    }
 
     let report = stats::query(&window)?;
     if args.line {

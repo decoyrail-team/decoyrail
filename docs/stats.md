@@ -162,3 +162,15 @@ Breakdown rows are sorted by cost (then requests, then name), except
 plan-covered traffic shows as `<model> [subscription]` and never blends into
 a pay-per-token row; requests without usage data group under
 `(no usage data)`.
+
+## The waste report: `decoyrail stats --waste`
+
+Where `stats` says what was spent, `--waste` says what was spent for nothing, broken down by cause and priced in dollars:
+
+- **Retried identical requests**: the same request (same destination, method, and body, matched by the [spend tripwire's](audit-and-metering.md#the-spend-tripwire) salted fingerprint) re-sent within the tripwire's window. Every re-send after the first is waste, priced at what its response actually metered.
+- **Runaway loops**: the same, past the tripwire's repeat threshold. Repeats the tripwire blocked are counted alongside (they cost nothing; the report shows the loop's true length).
+- **Prompt-cache waste**: repeating context that re-billed at the full input rate for want of a cache marker, priced by the [cache doctor](audit-and-metering.md#the-prompt-cache-report) for the current billing period; `decoyrail cache` has the per-model breakdown.
+
+The numbers are deliberately conservative. Only identifiable waste is counted: byte-identical repeats, never "similar" requests. Billable dollars and plan-absorbed API-equivalent dollars stay separate, exactly as the meter keeps them. A repeat whose response carried no parseable usage is counted and flagged unpriced, never guessed at. And requests written before fingerprints existed can't be grouped, so the report says so instead of reporting zero.
+
+The thresholds are the policy's `[spend_tripwire]` settings, so the report and the enforcement agree on what counts as a loop. `--waste` composes with the window flags and with `--json` (its own schema, versioned separately from the stats report). Everything is read from local state; the report never needs the network.

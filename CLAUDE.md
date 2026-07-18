@@ -94,7 +94,11 @@ fan-out serialization (`FanoutGate`), and keep-alive pre-warm scheduling
 is Pro ·
 `stats.rs` analytics over the audit log
 (`decoyrail stats`: windows/breakdowns/JSON/one-line; incremental aggregate
-cache in `stats-cache.json`) · `proxy.rs` CONNECT + TLS MITM + plaintext
+cache in `stats-cache.json`) · `waste.rs` the waste report (plan 001,
+`decoyrail stats --waste`): audit-event scan grouped by the plan-002
+fingerprints into retry/loop chains at the tripwire's thresholds, plus the
+cache doctor's priced repairable waste; billable vs plan-absorbed kept
+apart, unpriced repeats flagged · `proxy.rs` CONNECT + TLS MITM + plaintext
 HTTP + request pipeline · `engine.rs` shared runtime state + hot-reload ·
 `config.rs` paths + atomic writes · `main.rs` CLI. `src/lib.rs` exposes these
 modules so `tests/` can drive the pipeline in-process.

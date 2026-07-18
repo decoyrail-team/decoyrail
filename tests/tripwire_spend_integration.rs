@@ -415,6 +415,28 @@ async fn spend_tripwire_end_to_end() {
     let verified = decoyrail::audit::verify().expect("audit chain verifies after all scenarios");
     assert!(verified > 0);
 
+    // 9. THE WASTE REPORT SEES IT ALL (plan 001): the deliberately repeated
+    //    request is identified as waste, the loops crossed the tripwire
+    //    threshold, and the blocked repeats are counted. Costs here are
+    //    unpriced (the echo upstream returns no usage on the repeated
+    //    bodies), which the report flags instead of guessing.
+    let waste = decoyrail::waste::report(&decoyrail::stats::Window::All).unwrap();
+    assert!(
+        waste.fingerprinted_requests >= 10,
+        "the window's LLM requests carry fingerprints: {waste:?}"
+    );
+    assert!(
+        waste.loops.chains >= 1,
+        "the replayed request must surface as a loop: {waste:?}"
+    );
+    assert!(waste.blocked_repeats >= 1, "tripwire denies counted");
+    assert!(
+        waste.loops.unpriced + waste.retries.unpriced >= 1,
+        "usage-less repeats are flagged unpriced, not silently zero-cost"
+    );
+    let text = decoyrail::waste::render(&waste);
+    assert!(text.contains("Runaway loops"), "{text}");
+
     std::env::remove_var("DECOYRAIL_HOME");
     std::env::remove_var("DECOYRAIL_EXTRA_CA");
 }

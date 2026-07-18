@@ -56,10 +56,12 @@ automatic fixes are the paid tier.
   request. Where usage can't be parsed, the byte estimate remains and is
   labeled as an estimate. Accurate metering stays in the free core; the
   fleet roll-up in v0.4 is what the team tiers add.
-- **The waste report** (free): the metering above, turned into a verdict. A
-  report of what was identifiably wasted this month and why: retried
-  requests, cache misses on repeated context, runaway loops, priced in
-  dollars per seat, agent, and session.
+- **The waste report** (free, shipped): the metering above, turned into a
+  verdict. `decoyrail stats --waste` reports what was identifiably wasted
+  this month and why: retried identical requests, runaway loops, and cache
+  misses on repeated context, priced in dollars, with billable and
+  plan-absorbed kept apart and unpriceable repeats flagged rather than
+  guessed at.
 - **Reference cost for subscription plans** (free): flat plans are not free
   tokens. The included allowance runs out, heavy sessions hit plan limits,
   and usage past the plan bills at API rates. Subscription traffic keeps
