@@ -356,20 +356,23 @@ async fn model_router_end_to_end() {
     // 8. HOT RELOAD + UNKNOWN TARGET (AC f): a mid-session policy write
     //    swaps the map; the next request routes per the new map, and a
     //    target the pricing table doesn't know forwards as configured (the
-    //    provider errors informatively) with the likely typo flagged.
+    //    provider errors informatively) with the likely typo flagged. The
+    //    routed model is one the doctor has never seen, so the note prices
+    //    no forfeited cache: there is none to forfeit.
     decoyrail::policy_edit::write_policy(
-        &policy_text("\"claude-opus-4\" = \"totally-unknown-model\""),
+        &policy_text("\"claude-opus-4-1\" = \"totally-unknown-model\""),
         "test",
     )
     .unwrap();
     bump_mtime(&home.path().join("policy.toml"), 6);
-    let resp = post("/routed/messages", body_opus.clone()).await;
+    let body_opus41 = body_opus.replace("claude-opus-4", "claude-opus-4-1");
+    let resp = post("/routed/messages", body_opus41.clone()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
             .get("x-decoyrail-route")
             .expect("route marker header"),
-        "claude-opus-4 -> totally-unknown-model"
+        "claude-opus-4-1 -> totally-unknown-model"
     );
     assert!(
         resp.text().await.unwrap().contains("totally-unknown-model"),
@@ -381,17 +384,69 @@ async fn model_router_end_to_end() {
         line.contains("totally-unknown-model") && line.contains("not in the pricing table"),
         "the unknown target must be logged as such: {line}"
     );
+    assert!(
+        !line.contains("forfeits a warm"),
+        "no warm cache on record for this model, so none is priced: {line}"
+    );
 
-    // 9. THE AUDIT TRAIL RECONSTRUCTS EVERY REWRITE (AC c): exactly the two
-    //    rewrites above were recorded, each naming rule + from -> to, the
-    //    forwarded requests audit as plain allow events, and the
-    //    tamper-evident chain verifies across the whole run (what
-    //    `decoyrail log --verify` runs).
-    assert_eq!(events.len(), 2, "one route event per rewritten request");
+    // 9. COMPOSITION WITH THE BUDGET SOFT-LANDING (plan 003): in the band,
+    //    soft-landing rewrites first and the route map applies to the
+    //    result, so a route map keyed on the downgraded model fires. Both
+    //    rewrites announce themselves independently.
+    decoyrail::policy_edit::write_policy(
+        &format!(
+            "{}[soft_landing]\nthreshold_pct = 80\n\
+             map = {{ \"claude-opus-4\" = \"claude-sonnet-5\" }}\n",
+            policy_text("\"claude-sonnet-5\" = \"claude-haiku-4-5\"")
+        ),
+        "test",
+    )
+    .unwrap();
+    bump_mtime(&home.path().join("policy.toml"), 8);
+    // Budget $1.00 puts the seeded $0.85 at 85%: inside the band.
+    decoyrail::meter::save_budget(1.0).unwrap();
+    bump_mtime(&home.path().join("budget.json"), 8);
+    let resp = post("/routed/messages", body_opus.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-decoyrail-downgrade")
+            .expect("downgrade marker header"),
+        "claude-opus-4 -> claude-sonnet-5"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-decoyrail-route")
+            .expect("route marker header"),
+        "claude-sonnet-5 -> claude-haiku-4-5"
+    );
+    assert_eq!(
+        resp.text().await.unwrap(),
+        body_opus.replace("claude-opus-4", "claude-haiku-4-5"),
+        "the route map applies to the post-soft-landing model"
+    );
+    let events = route_events();
+    assert!(
+        events
+            .last()
+            .unwrap()
+            .contains("route: model claude-sonnet-5 -> claude-haiku-4-5"),
+        "the route event records the model it actually saw"
+    );
+    // Even with the band active, a deny rule wins over everything: the cost
+    // verbs (soft-landing and the router alike) never see a denied request.
+    let resp = post("/blocked/messages", body_opus.clone()).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 10. THE AUDIT TRAIL RECONSTRUCTS EVERY REWRITE (AC c): exactly the
+    //     three rewrites above were recorded, each naming rule + from -> to,
+    //     the forwarded requests audit as plain allow events, and the
+    //     tamper-evident chain verifies across the whole run (what
+    //     `decoyrail log --verify` runs).
+    assert_eq!(events.len(), 3, "one route event per rewritten request");
     assert!(events
         .iter()
-        .all(|l| l.contains("\"rule\":\"cheap-tier\"")
-            && l.contains("route: model claude-opus-4 -> ")));
+        .all(|l| l.contains("\"rule\":\"cheap-tier\"") && l.contains("route: model ")));
     let log = std::fs::read_to_string(&audit_path).unwrap();
     assert!(
         log.lines()
