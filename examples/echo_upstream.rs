@@ -5,13 +5,16 @@
 //! Usage: echo_upstream <port> <cert_out.pem>
 //!   Writes its self-signed cert PEM to <cert_out.pem> (point DECOYRAIL_EXTRA_CA
 //!   at it so Decoyrail trusts this upstream), then serves:
-//!     GET /headers  → JSON echo of received request headers
-//!     any other     → 200 "ok"
+//!     GET /headers       → JSON echo of received request headers
+//!     POST /v1/messages  → Anthropic-shaped stub reply with a usage block,
+//!                          echoing the requested model (for the demo tapes
+//!                          and anything that needs priceable traffic)
+//!     any other          → 200 "ok"
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -34,6 +37,32 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, std::co
         }
         let body = serde_json::json!({ "headers": map }).to_string();
         Ok(Response::new(Full::new(Bytes::from(body))))
+    } else if req.uri().path() == "/v1/messages" {
+        // Stand-in for an LLM API: echo the requested model and report a
+        // plausible coding-agent usage so the metering side has something
+        // real to parse and price. Deterministic on purpose.
+        let body = match req.into_body().collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        let model = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| Some(v.get("model")?.as_str()?.to_string()))
+            .unwrap_or_else(|| "claude-sonnet-5".to_string());
+        let reply = serde_json::json!({
+            "id": "msg_stub",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 52_413, "output_tokens": 387 }
+        })
+        .to_string();
+        Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(reply)))
+            .expect("static response parts"))
     } else {
         Ok(Response::new(Full::new(Bytes::from("ok"))))
     }

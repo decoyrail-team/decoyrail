@@ -335,6 +335,8 @@ decoyrail policy sign                # review the diff, confirm, done
 
 `policy sign` shows what changed against the last trusted version and asks for confirmation. It only runs on a terminal: the point is that a human read the diff. Signing a file that is already trusted is a quiet no-op, and signing one that does not parse is refused, so a typo cannot become a deny-all surprise at the next restart.
 
+![A hand edit to policy.toml is refused everywhere until decoyrail policy sign shows the diff and a human blesses it](demos/policy-sign.gif)
+
 What happens when the file does not verify:
 
 - At startup, the proxy refuses to run and tells you what to do (review, then `decoyrail policy sign`). The refusal is also written to the audit log as a `tamper` event.

@@ -12,6 +12,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy cargo build --release
+# The spend-tripwire and waste-report tapes run against the local stub
+# upstream, the same one the e2e script uses.
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy cargo build --release --example echo_upstream
 
 for tape in docs/demos/*.tape; do
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \

@@ -287,6 +287,8 @@ How it behaves:
 
 The monthly budget is a backstop, and it fires far too late for an agent that got stuck at 2am retrying the same failing request. The spend tripwire watches for runaway behavior in near real time and trips in minutes, not at the end of the month. It is a safety feature, so it ships in the free tier, on by default, and no license state affects it.
 
+![An agent stuck resending one request is blocked by the spend tripwire; decoyrail log -t shows the trip live, and decoyrail trip clear lifts it](demos/spend-tripwire.gif)
+
 Two purely mechanical signals, no guessing about intent:
 
 - **Repetition:** the same request (same destination, method, and body) seen `repeats` times inside the sliding window. Fifteen byte-identical LLM calls in five minutes is a loop, not a retry.
