@@ -196,6 +196,24 @@ traffic (`decoyrail dlp set pan block`).
 Run `decoyrail policy show` to see the live version. The file on disk is the
 source of truth.
 
+## `[cache]`: the Pro cache controls
+
+The free [prompt-cache doctor](audit-and-metering.md#the-prompt-cache-report) always runs and only observes. The `[cache]` table is how you switch on the three active behaviors it diagnoses for, described in [Cache repair and active management](audit-and-metering.md#cache-repair-and-active-management-pro). Each one needs two things: the knob set here, and a Pro license installed. Without a license the knobs are inert and every request passes through byte-identical; nothing errors and nothing blocks.
+
+```toml
+[cache]
+repair = true              # splice a cache_control marker when a prefix repeats unmarked
+keep_alive = true          # pre-warm a warm cache during idle so it survives a long build
+keep_alive_secs = 240      # idle seconds before a pre-warm fires (default sits under the 5m TTL)
+keep_alive_max = 6         # pre-warms per prefix per session; a real request resets the count
+serialize_fanout = true    # parallel same-prefix requests: one cache write, the rest read it
+fanout_timeout_ms = 2000   # how long a held request waits for the leader before proceeding
+```
+
+Everything defaults to off or to the safe value shown, and the table hot-reloads like the rest of the policy. Every marker injection and every proxy-initiated pre-warm lands in the audit log (`cache` and `keepalive` events), and `decoyrail cache` reports what the active layer actually did.
+
+These are cost knobs, not security knobs: a `[cache]` table can never release a secret, loosen a rule, or keep a deny from denying. A pre-warm the proxy initiates runs the full policy and swap pipeline, exactly like a request your agent sent.
+
 ## Editing from the CLI
 
 The file is always yours to edit by hand, but for routine changes the
