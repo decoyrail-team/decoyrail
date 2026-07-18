@@ -35,7 +35,7 @@ doing and why something was denied.
 
 | Field | Meaning |
 |---|---|
-| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), `keepalive` (a proxy-initiated cache pre-warm, Pro), or `downgrade` (a budget soft-landing model rewrite, Pro) |
+| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), `keepalive` (a proxy-initiated cache pre-warm, Pro), `downgrade` (a budget soft-landing model rewrite, Pro), or `route` (a [model-router](policy.md#route-allow-on-a-cheaper-model-pro) rewrite, Pro; the note names the mapping and prices any warm prompt cache it forfeits) |
 | `rule` | the policy rule that decided it (`default` when nothing matched) |
 | `escalated` | the matching rule said `escalate` (resolved via fallback) |
 | `swaps` | secrets substituted, as `name@location` |
@@ -304,5 +304,7 @@ Downgrades never happen silently:
 - `decoyrail status` says when the session is in the degraded band.
 
 One caveat, which the audit note also states: provider prompt caches are model-scoped, so a model rewrite invalidates the warm cache and the first downgraded request pays a cold cache write for the new model. The visibility exists so that cost stays attributable instead of mysterious.
+
+When a [route rule](policy.md#route-allow-on-a-cheaper-model-pro) also matches, soft-landing rewrites first and the route map applies to the result, each with its own audit event.
 
 The threshold reads the same billable spend as the kill switch, so subscription traffic never pushes a session into the band. This is a Pro feature: without a license, or with the table absent, behavior is exactly today's, nothing between a healthy budget and the hard kill switch.

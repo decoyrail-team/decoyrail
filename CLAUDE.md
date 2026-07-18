@@ -63,7 +63,9 @@ sensitive env vars for `decoyrail run` · `swap.rs` decoy↔real substitution + 
 `debug = true` dumps hit payloads, secrets scrubbed, to `dlp-debug/`) ·
 `policy.rs` rules-first egress policy + per-rule secret release
 (`allow_secrets`) + the trusted/parse-only load split (`load_trusted` vs
-`load_or_default`) · `integrity.rs` policy integrity (plan 018): keyed record
+`load_or_default`) + the `route` action (plan 006: allow plus a per-rule
+model map the pipeline applies via softland's rewrite; Pro-gated, audited
+as `route`, marked with `x-decoyrail-route`) · `integrity.rs` policy integrity (plan 018): keyed record
 in `policy.toml.sig` (HMAC under a key derived from the vault key), verify
 verdicts, the one recorded write path (`install`), blessing
 (`decoyrail policy sign`), diff ·

@@ -25,8 +25,9 @@ name = "anthropic"                     # label; shows up in `decoyrail log`
 hosts = ["api.anthropic.com"]          # required; glob per entry
 methods = ["POST"]                     # optional; empty = any method
 path_prefixes = ["/v1"]                # optional; empty = any path
-action = "allow"                       # allow | deny | warn | escalate
+action = "allow"                       # allow | deny | warn | route | escalate
 allow_secrets = ["anthropic"]          # optional; secrets released here
+# route = { "claude-opus-4" = "claude-sonnet-5" }  # model map; route rules only
 
 [dlp]                                  # sensitive-data detectors
 pan = "warn"                           # block | mask | warn | off
@@ -153,6 +154,37 @@ releasing rule can never win. Decoyrail warns about that (and about
 Its main use is as the default action while you tune a policy. With `default_action = "warn"` (or, for one session, `decoyrail run --watch`, which pins the default to warn without touching the file), an agent hitting an unlisted host keeps working, and the log tells you exactly which hosts are riding the default so you can write the allow or deny rules you actually want. Named deny and escalate rules still block in this mode.
 
 Be honest with yourself about the tradeoff: warn does not block the exfiltration of non-secret data (source code, prompts) to unlisted hosts, it records it. The shipped default stays deny, and the [threat model](threat-model.md#warn-mode-records-it-does-not-block) spells this out. Treat warn as the tuning posture with an exit, not a place to live: watch the log, add rules, go back to deny.
+
+## `route`: allow, on a cheaper model (Pro)
+
+`route` is the model router (the standing-policy sibling of the [budget soft-landing](audit-and-metering.md#budget-soft-landing-pro)). A route rule allows exactly like `allow`, and additionally rewrites the requested model per its explicit map before the request forwards:
+
+```toml
+[[rule]]
+name = "anthropic-cheap-tier"
+hosts = ["api.anthropic.com"]
+action = "route"
+allow_secrets = ["provider:anthropic"]
+route = { "claude-opus-4" = "claude-sonnet-5" }
+```
+
+Policy-wise it is an allow. Secrets release through `allow_secrets` the same way, first-match-wins ordering applies unchanged (a deny or escalate rule above it wins), and a tripwire, a blocking DLP hit, or an exhausted budget denies a routed request exactly as it denies an allowed one. Security verbs always outrank the route.
+
+The map is yours, like the soft-landing map: Decoyrail has no built-in opinion about which models are equivalent. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A rule with no map, or a request whose model is absent, unmapped, or unidentifiable, forwards unmodified. Never an error, never a guess.
+
+Rewrites never happen silently:
+
+- every rewritten request gets a `route` audit event naming the rule and the mapping,
+- the response carries an `x-decoyrail-route: <from> -> <to>` header,
+- `decoyrail status` lists the policy's route rules and says when they are inert for want of a license.
+
+Provider prompt caches are model-scoped, so a rewrite abandons any warm cache for the original model; the audit note says so, and when the [cache doctor](audit-and-metering.md#the-prompt-cache-report) knows a warm prefix for that model it prices what the rewrite forfeits, so a route that costs more than it saves is visible instead of mysterious. A map that names a target model the pricing table doesn't know still forwards as configured (the provider errors informatively); the audit note and the policy lint flag the likely typo, as does a route rule whose map is empty.
+
+When the budget soft-landing is also active and the session is in its band, soft-landing rewrites first and the route map applies to the result, so the map is always consulted against the model actually about to forward. Both rewrites get their own audit events.
+
+This is a Pro feature, and the gate moves in only one direction: without a license the rule still allows (license state never changes what is reachable), the model just rides through untouched.
+
+`decoyrail policy add my-rule --host api.anthropic.com --action route` creates a route rule from the CLI; the map itself is edited in the file (`decoyrail policy edit`, or a hand edit plus `decoyrail policy sign`), which validates it like any other policy change.
 
 ## `escalate`: fails closed today, judge later
 
