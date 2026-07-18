@@ -68,8 +68,10 @@ in `policy.toml.sig` (HMAC under a key derived from the vault key), verify
 verdicts, the one recorded write path (`install`), blessing
 (`decoyrail policy sign`), diff ·
 `audit.rs` hash-chained, lock-serialized, head-anchored tamper-evident log ·
-`meter.rs` spend metering + budget · `pricing.rs` per-model token pricing +
-provider `usage` accounting (built-in table, `pricing.json` overrides) ·
+`meter.rs` spend metering + budget + subscription reference cost and the
+declared plan price/verdict (`decoyrail plan`, plan 019) · `pricing.rs`
+per-model token pricing + provider `usage` accounting (built-in table,
+`pricing.json` overrides) + the billable/reference split (`split_cost`) ·
 `license.rs` offline signed license unlocking paid tiers, fails open to Free
 (never blocks traffic; `decoyrail license`) · `cache.rs` prompt-cache layer:
 observe-only hygiene doctor per host+model, `decoyrail cache` report

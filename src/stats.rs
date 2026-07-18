@@ -130,6 +130,11 @@ pub struct Bucket {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
+    /// API-equivalent reference cost of subscription traffic (plan 019).
+    /// Reported next to `cost_usd`, never summed into it. serde(default)
+    /// keeps pre-019 caches loading.
+    #[serde(default)]
+    pub ref_cost_usd: f64,
     /// Allowed requests whose provider response carried no usage: visible,
     /// never silently priced by estimate.
     pub no_usage: u64,
@@ -157,6 +162,7 @@ impl Bucket {
         self.cache_read_tokens += o.cache_read_tokens;
         self.cache_write_tokens += o.cache_write_tokens;
         self.cost_usd += o.cost_usd;
+        self.ref_cost_usd += o.ref_cost_usd;
         self.no_usage += o.no_usage;
         self.bytes_up += o.bytes_up;
         self.bytes_down += o.bytes_down;
@@ -367,6 +373,7 @@ impl Aggregator {
                         b.cache_read_tokens += u.cache_read;
                         b.cache_write_tokens += u.cache_write;
                         b.cost_usd += u.cost_usd;
+                        b.ref_cost_usd += u.ref_cost_usd;
                     }
                     None => {
                         b.no_usage += 1;
@@ -465,6 +472,7 @@ impl Aggregator {
                 to.cache_read_tokens += u.cache_read;
                 to.cache_write_tokens += u.cache_write;
                 to.cost_usd += u.cost_usd;
+                to.ref_cost_usd += u.ref_cost_usd;
                 to.bytes_down += ev.bytes_down;
                 if let Some(ms) = ev.dur_ms {
                     to.dur.observe(ms);
@@ -488,6 +496,7 @@ impl Aggregator {
                 b.cache_read_tokens += u.cache_read;
                 b.cache_write_tokens += u.cache_write;
                 b.cost_usd += u.cost_usd;
+                b.ref_cost_usd += u.ref_cost_usd;
                 b.bytes_down += ev.bytes_down;
             }
             (None, None) => {
@@ -673,6 +682,9 @@ pub struct BucketOut {
     pub tokens: TokensOut,
     pub cache_hit_ratio: Option<f64>,
     pub cost_usd: f64,
+    /// API-equivalent dollars absorbed by flat-rate plans (plan 019); never
+    /// part of `cost_usd`. Additive to schema v1, like `warns`.
+    pub plan_absorbed_usd: f64,
     pub no_usage_requests: u64,
     pub bytes: BytesOut,
     pub duration_ms: Option<DurOut>,
@@ -708,6 +720,7 @@ impl BucketOut {
             },
             cache_hit_ratio: (context > 0).then(|| b.cache_read_tokens as f64 / context as f64),
             cost_usd: b.cost_usd,
+            plan_absorbed_usd: b.ref_cost_usd,
             no_usage_requests: b.no_usage,
             bytes: BytesOut {
                 up: b.bytes_up,
@@ -1061,6 +1074,14 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
         String::new()
     };
     let _ = writeln!(out, "Spend: ${:.4}{no_usage}", t.cost_usd);
+    // Reference dollars get their own labeled line, never a share of Spend.
+    if t.plan_absorbed_usd > 0.0 {
+        let _ = writeln!(
+            out,
+            "Plan-absorbed: ~${:.4} API-equivalent (subscription traffic, not billed)",
+            t.plan_absorbed_usd
+        );
+    }
     let _ = writeln!(
         out,
         "Bytes: up {}  down {}",
@@ -1132,6 +1153,11 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
     let name_w = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(8);
     for (name, s) in rows {
         let alerts = s.alert_count();
+        let plan = if s.plan_absorbed_usd > 0.0 {
+            format!("  plan-absorbed ~${:.4}", s.plan_absorbed_usd)
+        } else {
+            String::new()
+        };
         let cached = s
             .cache_hit_ratio
             .map(|r| format!("  cached {:.0}%", r * 100.0))
@@ -1145,7 +1171,7 @@ pub fn render_human(report: &Report, by: Breakdown) -> String {
         };
         let _ = writeln!(
             out,
-            "  {name:<name_w$}  {:>5} req  in {:>8}  out {:>8}  ${:.4}{cached}{alert_chip}",
+            "  {name:<name_w$}  {:>5} req  in {:>8}  out {:>8}  ${:.4}{plan}{cached}{alert_chip}",
             s.requests,
             fmt_tokens(s.tokens.input + s.tokens.cache_read + s.tokens.cache_write),
             fmt_tokens(s.tokens.output),
@@ -1176,6 +1202,7 @@ mod tests {
             cache_read,
             cache_write: 0,
             cost_usd: cost,
+            ref_cost_usd: 0.0,
         }
     }
 
@@ -1328,6 +1355,125 @@ mod tests {
         assert_eq!(june.totals.denies.dlp, 0);
         let human = render_human(&june, Breakdown::Model);
         assert!(human.contains("0 dlp"), "zeros must print:\n{human}");
+    }
+
+    #[test]
+    fn subscription_reference_stays_out_of_billable_buckets() {
+        let (_g, _dir) = setup();
+        let sub_usage = |ref_cost: f64| UsageRec {
+            model: "claude-sonnet-5 [subscription]".into(),
+            input: 1000,
+            output: 200,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+            ref_cost_usd: ref_cost,
+        };
+        let mut a = Auditor::open().unwrap();
+        // Mixed session on one host: an api-key request (seq 0), a buffered
+        // subscription request (seq 1), a streamed subscription request whose
+        // usage arrives via follow-up (seq 2 + 3), and an uncorrelated usage
+        // event (seq 4, pruned correlation).
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                dur_ms: Some(400),
+                usage: Some(usage("claude-sonnet-5", 1000, 200, 0, 0.01)),
+                ..Default::default()
+            },
+            "2026-06-05T10:00:00.000Z".into(),
+        )
+        .unwrap();
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                dur_ms: Some(300),
+                usage: Some(sub_usage(0.0075)),
+                ..Default::default()
+            },
+            "2026-06-05T10:01:00.000Z".into(),
+        )
+        .unwrap();
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "allow".into(),
+                sid: "s1".into(),
+                ..Default::default()
+            },
+            "2026-06-05T10:02:00.000Z".into(),
+        )
+        .unwrap();
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "usage".into(),
+                sid: "s1".into(),
+                req_seq: Some(2),
+                dur_ms: Some(900),
+                usage: Some(sub_usage(0.003)),
+                ..Default::default()
+            },
+            "2026-06-05T10:03:00.000Z".into(),
+        )
+        .unwrap();
+        a.append(
+            Entry {
+                host: "api.anthropic.com".into(),
+                action: "usage".into(),
+                sid: "s1".into(),
+                usage: Some(sub_usage(0.002)),
+                ..Default::default()
+            },
+            "2026-06-05T10:04:00.000Z".into(),
+        )
+        .unwrap();
+
+        let report = query(&wide()).unwrap();
+        let t = &report.totals;
+        // Billable spend is the api-key request alone; every reference dollar
+        // lands in plan_absorbed_usd, whichever ingestion path it took.
+        assert!((t.cost_usd - 0.01).abs() < 1e-12, "cost {}", t.cost_usd);
+        assert!(
+            (t.plan_absorbed_usd - 0.0125).abs() < 1e-12,
+            "absorbed {}",
+            t.plan_absorbed_usd
+        );
+
+        // The two billing modes are separate by_model buckets sharing nothing.
+        let billed = report
+            .by_model
+            .iter()
+            .find(|m| m.name == "claude-sonnet-5")
+            .unwrap();
+        assert!((billed.stats.cost_usd - 0.01).abs() < 1e-12);
+        assert_eq!(billed.stats.plan_absorbed_usd, 0.0);
+        assert_eq!(billed.stats.requests, 1);
+        let sub = report
+            .by_model
+            .iter()
+            .find(|m| m.name == "claude-sonnet-5 [subscription]")
+            .unwrap();
+        assert_eq!(sub.stats.cost_usd, 0.0);
+        assert!((sub.stats.plan_absorbed_usd - 0.0125).abs() < 1e-12);
+        assert_eq!(sub.stats.requests, 2);
+
+        // Human output labels the reference figure and never folds it into
+        // Spend.
+        let human = render_human(&report, Breakdown::Model);
+        assert!(human.contains("Spend: $0.0100"), "{human}");
+        assert!(
+            human.contains("Plan-absorbed: ~$0.0125 API-equivalent"),
+            "{human}"
+        );
+        assert!(human.contains("plan-absorbed ~$0.0125"), "{human}");
+        // The stable one-liner still reports billable dollars only.
+        let line = render_line(&report);
+        assert!(line.contains("$0.01"), "{line}");
     }
 
     #[test]

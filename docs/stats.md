@@ -24,16 +24,22 @@ Requests: 41 (39 allowed, 0 warned, 2 denied: 1 policy, 1 tripwire, 0 dlp, 0 bud
 Security: 1 tripwire hits, 0 DLP alerts, 0 policy tampers
 Tokens: in 48.2k  out 12.9k  cache read 1.1M  cache write 22.0k  cached 96%
 Spend: $1.8420
+Plan-absorbed: ~$3.1080 API-equivalent (subscription traffic, not billed)
 Bytes: up 1.2 MB  down 6.4 MB
 Latency: avg 830ms  p95 ~2.0s  max 9.4s  (39 measured)
 
 By model:
-  claude-sonnet-5     37 req  in     1.1M  out    12.9k  $1.8420  cached 96%
-  (no usage data)      4 req  in        0  out        0  $0.0000  [2 alerts]
+  claude-sonnet-5                    21 req  in   612.4k  out     7.1k  $1.8420  cached 96%
+  claude-sonnet-5 [subscription]     16 req  in   501.2k  out     5.8k  $0.0000  plan-absorbed ~$3.1080  cached 95%
+  (no usage data)                     4 req  in        0  out        0  $0.0000  [2 alerts]
 ```
 
 Zeros are printed on purpose. A window with no tripwires saying "0 tripwire
-hits" is itself a report; silence would be ambiguous.
+hits" is itself a report; silence would be ambiguous. The plan-absorbed
+line appears only when subscription traffic exists in the window: it is the
+API-equivalent reference cost of plan-covered requests (see
+[metering](audit-and-metering.md)), reported next to spend and never summed
+into it.
 
 ## Windows and breakdowns
 
@@ -146,6 +152,7 @@ rows alike, has the same shape:
 | `tokens` | `{input, output, cache_read, cache_write, total}` |
 | `cache_hit_ratio` | `cache_read / (input + cache_read)`, null with no context tokens |
 | `cost_usd` | sum of per-request metered cost (subscription traffic is $0) |
+| `plan_absorbed_usd` | API-equivalent reference cost of subscription traffic: what the plan absorbed at API rates, cache multipliers included. Never part of `cost_usd` (added in a v1-compatible way; absent means an older binary) |
 | `no_usage_requests` | allowed requests whose response carried no usage |
 | `bytes` | `{up, down}` as seen at the proxy |
 | `duration_ms` | `{avg, p95, max, measured}`, null when nothing was measured |

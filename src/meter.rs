@@ -27,6 +27,11 @@ pub struct ModelUsage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
+    /// API-equivalent reference cost of subscription traffic: what these
+    /// tokens would have billed at API rates (plan 019). Never summed into
+    /// `cost_usd` or the budget; zero for usage-billed rows.
+    #[serde(default)]
+    pub ref_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -49,6 +54,11 @@ impl HostUsage {
 
     pub fn cost_usd(&self) -> f64 {
         self.est_cost_usd + self.metered_cost_usd()
+    }
+
+    /// API-equivalent dollars the plan absorbed at this host (plan 019).
+    pub fn ref_cost_usd(&self) -> f64 {
+        self.models.values().map(|m| m.ref_cost_usd).sum()
     }
 }
 
@@ -142,6 +152,13 @@ impl Meter {
         self.per_host.values().map(|u| u.est_cost_usd).sum()
     }
 
+    /// API-equivalent dollars absorbed by flat-rate plans this period: the
+    /// reference cost of subscription traffic (plan 019). Reported alongside
+    /// spend, never added to it; the budget never sees this figure.
+    pub fn plan_absorbed(&self) -> f64 {
+        self.per_host.values().map(|u| u.ref_cost_usd()).sum()
+    }
+
     /// Budget is enforced only when set (> 0).
     pub fn over_budget(&self) -> bool {
         self.budget_usd > 0.0 && self.total_cost() >= self.budget_usd
@@ -174,13 +191,16 @@ impl Meter {
 
     /// Record exact provider-reported tokens for one request under
     /// `model_key` (see `pricing::model_key`). `cost_usd` is what the tokens
-    /// actually cost: zero when the request was subscription-billed.
+    /// actually cost (zero when subscription-billed); `ref_cost_usd` is the
+    /// API-equivalent reference for subscription traffic (zero when billed).
+    /// `pricing::split_cost` produces the pair.
     pub fn record_tokens(
         &mut self,
         host: &str,
         model_key: &str,
         usage: &crate::pricing::TokenUsage,
         cost_usd: f64,
+        ref_cost_usd: f64,
     ) {
         let entry = self.per_host.entry(host.to_string()).or_default();
         let m = entry.models.entry(model_key.to_string()).or_default();
@@ -190,6 +210,7 @@ impl Meter {
         m.cache_read_tokens += usage.cache_read;
         m.cache_write_tokens += usage.cache_write;
         m.cost_usd += cost_usd;
+        m.ref_cost_usd += ref_cost_usd;
     }
 
     /// Add downstream bytes to an already-counted request, with no cost.
@@ -288,9 +309,11 @@ impl SessionMeter {
         model_key: &str,
         usage: &crate::pricing::TokenUsage,
         cost_usd: f64,
+        ref_cost_usd: f64,
     ) {
         self.roll(now_period);
-        self.delta.record_tokens(host, model_key, usage, cost_usd);
+        self.delta
+            .record_tokens(host, model_key, usage, cost_usd, ref_cost_usd);
     }
 
     pub fn add_downstream_bytes(&mut self, now_period: &str, host: &str, bytes_down: u64) {
@@ -352,6 +375,7 @@ impl SessionMeter {
                 m.cache_read_tokens += mu.cache_read_tokens;
                 m.cache_write_tokens += mu.cache_write_tokens;
                 m.cost_usd += mu.cost_usd;
+                m.ref_cost_usd += mu.ref_cost_usd;
             }
         }
         disk.save()?;
@@ -373,6 +397,81 @@ pub fn save_budget(budget_usd: f64) -> Result<()> {
         &config::budget_path()?,
         serde_json::to_string_pretty(&bf)?.as_bytes(),
     )
+}
+
+/// A user-declared flat plan price (plan 019): what the subscription costs
+/// per month, so plan-absorbed totals can be read against it. Purely local
+/// and purely informational; nothing enforces on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanPrice {
+    pub usd: f64,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl PlanPrice {
+    fn name(&self) -> &str {
+        if self.label.is_empty() {
+            "plan"
+        } else {
+            &self.label
+        }
+    }
+}
+
+/// Read the declared plan price, if any. A missing or malformed file means
+/// none declared: totals render without a verdict.
+pub fn load_plan_price() -> Result<Option<PlanPrice>> {
+    let path = config::plan_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&text).ok())
+}
+
+pub fn save_plan_price(price: &PlanPrice) -> Result<()> {
+    config::ensure_home()?;
+    config::atomic_write(
+        &config::plan_path()?,
+        serde_json::to_string_pretty(price)?.as_bytes(),
+    )
+}
+
+pub fn clear_plan_price() -> Result<()> {
+    let path = config::plan_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// One sentence reading this period's plan-absorbed total against the
+/// declared plan price. The figures speak for themselves: no upgrade or
+/// downgrade advice, and the absorbed number is framed as a reference
+/// (API-equivalent), never as savings owed to Decoyrail.
+pub fn plan_verdict(price: &PlanPrice, absorbed_usd: f64) -> String {
+    let name = price.name();
+    if absorbed_usd <= 0.0 {
+        return format!(
+            "{name} (${:.2}/mo): no plan-covered traffic this period, so it absorbed nothing.",
+            price.usd
+        );
+    }
+    if absorbed_usd >= price.usd {
+        format!(
+            "{name} (${:.2}/mo): absorbed ~${absorbed_usd:.2} of API-equivalent usage this \
+             period; the plan absorbed more than it costs.",
+            price.usd
+        )
+    } else {
+        format!(
+            "{name} (${:.2}/mo): absorbed ~${absorbed_usd:.2} of API-equivalent usage this \
+             period; ${:.2} of headroom went unused.",
+            price.usd,
+            price.usd - absorbed_usd
+        )
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +585,7 @@ mod tests {
             "claude-sonnet-5",
             &usage,
             0.0075,
+            0.0,
         );
         a.flush("2026-07").unwrap();
         b.record_traffic("2026-07", "api.anthropic.com", 900, 4000);
@@ -495,6 +595,7 @@ mod tests {
             "claude-sonnet-5 [subscription]",
             &usage,
             0.0,
+            0.0075,
         );
         b.record_tokens(
             "2026-07",
@@ -502,6 +603,7 @@ mod tests {
             "claude-sonnet-5",
             &usage,
             0.0075,
+            0.0,
         );
         b.flush("2026-07").unwrap();
 
@@ -512,9 +614,14 @@ mod tests {
         assert_eq!(billed.requests, 2);
         assert_eq!(billed.input_tokens, 2000);
         assert_eq!(billed.cache_read_tokens, 10000);
+        assert_eq!(billed.ref_cost_usd, 0.0);
         let sub = &host.models["claude-sonnet-5 [subscription]"];
         assert_eq!(sub.input_tokens, 1000);
         assert_eq!(sub.cost_usd, 0.0);
+        // The subscription row's reference cost survives the flush merge and
+        // rolls up as plan-absorbed, never into spend.
+        assert!((sub.ref_cost_usd - 0.0075).abs() < 1e-9);
+        assert!((disk.plan_absorbed() - 0.0075).abs() < 1e-9);
         // Total = billed cost only; subscription tokens cost nothing, and
         // no byte estimate accrued because usage was parsed.
         assert!((disk.total_cost() - 0.015).abs() < 1e-9);
@@ -563,6 +670,55 @@ mod tests {
         assert_eq!(disk.period, "2026-07");
         assert!(!disk.per_host.contains_key("api.anthropic.com"));
         assert_eq!(disk.per_host["api.openai.com"].requests, 1);
+    }
+
+    #[test]
+    fn plan_price_round_trips_and_clears() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        assert!(load_plan_price().unwrap().is_none());
+        // Clearing with nothing declared is a quiet no-op, not an error.
+        clear_plan_price().unwrap();
+        save_plan_price(&PlanPrice {
+            usd: 200.0,
+            label: "Claude Max".into(),
+        })
+        .unwrap();
+        let p = load_plan_price().unwrap().expect("saved plan price");
+        assert_eq!(p.usd, 200.0);
+        assert_eq!(p.label, "Claude Max");
+        clear_plan_price().unwrap();
+        assert!(load_plan_price().unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_verdict_states_the_three_cases() {
+        let price = PlanPrice {
+            usd: 200.0,
+            label: "Claude Max".into(),
+        };
+        // Absorbed more than it costs: the plan is paying for itself.
+        let v = plan_verdict(&price, 340.0);
+        assert!(v.contains("$340.00"), "{v}");
+        assert!(v.contains("absorbed more than it costs"), "{v}");
+        // Absorbed much less: headroom went unused, stated without scolding.
+        let v = plan_verdict(&price, 60.0);
+        assert!(v.contains("$60.00"), "{v}");
+        assert!(v.contains("$140.00 of headroom went unused"), "{v}");
+        // No plan traffic in the window: no division error, plain statement.
+        let v = plan_verdict(&price, 0.0);
+        assert!(v.contains("absorbed nothing"), "{v}");
+        // An unlabeled plan reads as just "plan".
+        let v = plan_verdict(
+            &PlanPrice {
+                usd: 100.0,
+                label: String::new(),
+            },
+            50.0,
+        );
+        assert!(v.starts_with("plan ("), "{v}");
     }
 
     #[test]

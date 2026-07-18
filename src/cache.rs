@@ -97,12 +97,28 @@ pub struct KeyStats {
     /// so the report can quantify the opportunity).
     #[serde(default)]
     pub repairable: u64,
+    /// Canonical bytes of those repairable requests' repeating prefixes: the
+    /// context that re-billed at the full input rate for want of a marker.
+    /// The report prices this waste from it (plan 019).
+    #[serde(default)]
+    pub repairable_bytes: u64,
     /// Requests the proxy actually repaired (a marker spliced in). Zero unless
     /// Pro + `[cache] repair` is on.
     #[serde(default)]
     pub repaired: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_divergence: Option<Divergence>,
+}
+
+/// Price the waste `repairable_bytes` represents: context that re-billed at
+/// the full input rate when a cache marker would have made it cache reads,
+/// so the spread between the two rates is what was wasted. Byte-derived
+/// (the doctor sees request bodies, not usage), so callers render it with a
+/// `~`. For subscription traffic the same figure is the API-equivalent
+/// headroom burned (plan 019).
+pub fn repairable_waste_usd(repairable_bytes: u64, rate: &crate::pricing::ModelRate) -> f64 {
+    let tokens = (repairable_bytes / BYTES_PER_TOKEN) as f64;
+    tokens * (rate.input - rate.cache_read).max(0.0) / 1_000_000.0
 }
 
 impl KeyStats {
@@ -115,6 +131,7 @@ impl KeyStats {
         self.diverged += other.diverged;
         self.below_min += other.below_min;
         self.repairable += other.repairable;
+        self.repairable_bytes += other.repairable_bytes;
         self.repaired += other.repaired;
         // Latest divergence wins; RFC-3339 strings compare chronologically.
         match (&self.last_divergence, &other.last_divergence) {
@@ -290,6 +307,7 @@ impl Doctor {
         // repair isn't licensed/enabled, so the report can size the waste.
         let repair = if canon.markers == 0 && cacheable_ok && streak >= REPAIR_MIN_REPEATS {
             stats.repairable += 1;
+            stats.repairable_bytes += cacheable.len() as u64;
             Some(RepairPlan {
                 ttl_1h: gaps_total > 0 && gaps_over_ttl * 2 >= gaps_total,
                 section: section_at(&canon.sections, cut.saturating_sub(1)),
@@ -1086,6 +1104,16 @@ mod tests {
         assert_eq!(plan.section, "system[0]");
         let s = stats(&d);
         assert_eq!(s.repairable, 1);
+        // The repeating prefix's size is accrued so the report can price the
+        // waste; a repeated identical request is exactly this case.
+        assert!(s.repairable_bytes > 0);
+        let rate = crate::pricing::Pricing::default()
+            .rate_for(crate::pricing::Provider::Anthropic, Some("claude-sonnet-5"));
+        let waste = repairable_waste_usd(s.repairable_bytes, &rate);
+        // input 3.0 - cache_read 0.3 = 2.7 $/mtok over bytes/4 tokens.
+        let expected = (s.repairable_bytes / 4) as f64 * 2.7 / 1e6;
+        assert!((waste - expected).abs() < 1e-12, "waste was {waste}");
+        assert!(waste > 0.0);
     }
 
     #[test]

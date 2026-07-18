@@ -240,6 +240,19 @@ impl Pricing {
     }
 }
 
+/// Split one request's token cost into (billable, reference) dollars.
+/// Usage-billed tokens cost real money and have no reference figure;
+/// subscription tokens cost nothing but carry what the same tokens would
+/// have billed at API rates (plan 019). Exactly one side is ever nonzero,
+/// so no total can sum the two by accident.
+pub fn split_cost(billing: Billing, usage: &TokenUsage, rate: &ModelRate) -> (f64, f64) {
+    let api = usage.cost_usd(rate);
+    match billing {
+        Billing::Usage => (api, 0.0),
+        Billing::Subscription => (0.0, api),
+    }
+}
+
 /// The key a request's tokens accrue under in the meter: the model name,
 /// tagged when the traffic is plan-covered so the two billing modes never
 /// blend in one row.
@@ -623,6 +636,24 @@ mod tests {
             p.provider_for_host("api.openai.com"),
             Some(Provider::OpenAi)
         );
+    }
+
+    #[test]
+    fn split_cost_never_mixes_billable_and_reference() {
+        let rate = Pricing::default().rate_for(Provider::Anthropic, Some("claude-sonnet-5"));
+        let u = TokenUsage {
+            input: 1000,
+            output: 200,
+            cache_read: 5000,
+            cache_write: 100,
+        };
+        let api = u.cost_usd(&rate);
+        assert!(api > 0.0);
+        // Usage-billed: real cost, no reference figure.
+        assert_eq!(split_cost(Billing::Usage, &u, &rate), (api, 0.0));
+        // Subscription: zero marginal cost, full API-equivalent reference —
+        // cache reads and writes priced at their own multipliers.
+        assert_eq!(split_cost(Billing::Subscription, &u, &rate), (0.0, api));
     }
 
     #[test]

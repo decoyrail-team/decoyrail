@@ -62,8 +62,23 @@ enum Command {
     Cache,
     /// Set the monthly spend budget (USD; 0 = unlimited).
     Budget { usd: f64 },
+    /// Declare what your subscription plan costs, or show what it absorbed.
+    Plan(PlanArgs),
     /// Remove Decoyrail's trusted CA, keychain item, and local state.
     Uninstall(UninstallArgs),
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    /// Monthly plan price in USD, e.g. 200.
+    #[arg(long)]
+    price: Option<f64>,
+    /// Plan name shown in reports, e.g. "Claude Max".
+    #[arg(long)]
+    label: Option<String>,
+    /// Remove the declared plan price.
+    #[arg(long, conflicts_with_all = ["price", "label"])]
+    clear: bool,
 }
 
 #[derive(Args)]
@@ -403,6 +418,7 @@ fn main() -> Result<()> {
         Command::Status => status_cmd(),
         Command::Cache => cache_cmd(),
         Command::Budget { usd } => budget_cmd(usd),
+        Command::Plan(args) => plan_cmd(args),
         Command::Uninstall(a) => uninstall_cmd(a),
     }
 }
@@ -1898,6 +1914,17 @@ fn status_cmd() -> Result<()> {
     if meter.over_budget() {
         println!("  BUDGET EXHAUSTED: requests are being denied");
     }
+    // Reference dollars are their own labeled line, never a share of Spend,
+    // and the budget above never sees them.
+    let absorbed = meter.plan_absorbed().max(0.0);
+    if absorbed > 0.0 {
+        println!(
+            "Plan-absorbed: ~${absorbed:.4} API-equivalent (subscription traffic, not billed)"
+        );
+    }
+    if let Ok(Some(price)) = meter::load_plan_price() {
+        println!("Plan: {}", meter::plan_verdict(&price, absorbed));
+    }
     if meter.per_host.is_empty() {
         println!("No traffic recorded this period.");
     } else {
@@ -1946,7 +1973,11 @@ fn status_cmd() -> Result<()> {
                             String::new()
                         };
                         let cost = if model.ends_with("[subscription]") {
-                            "plan-covered".to_string()
+                            if m.ref_cost_usd > 0.0 {
+                                format!("plan-covered (~${:.4} API-equivalent)", m.ref_cost_usd)
+                            } else {
+                                "plan-covered".to_string()
+                            }
                         } else {
                             format!("${:.4}", m.cost_usd)
                         };
@@ -2037,11 +2068,19 @@ fn cache_cmd() -> Result<()> {
             }
             // The doctor doesn't split by billing mode, so a model with both
             // a usage row and a subscription row gets its hygiene block once,
-            // on whichever row prints first.
+            // on whichever row prints first (the waste framing follows that
+            // row's billing).
             let doctor_key = format!("{host} {model}");
             if !seen_keys.contains(&doctor_key) {
                 if let Some(s) = stats.per_key.get(&doctor_key) {
-                    print_hygiene(s);
+                    let waste = provider.map(|p| {
+                        let rate = pricing.rate_for(p, Some(model));
+                        (
+                            cache::repairable_waste_usd(s.repairable_bytes, &rate),
+                            subscription,
+                        )
+                    });
+                    print_hygiene(s, waste);
                     seen_keys.push(doctor_key);
                 }
             }
@@ -2055,7 +2094,7 @@ fn cache_cmd() -> Result<()> {
         }
         printed_any = true;
         println!("\n{key}");
-        print_hygiene(s);
+        print_hygiene(s, None);
     }
 
     if !printed_any {
@@ -2067,8 +2106,11 @@ fn cache_cmd() -> Result<()> {
     Ok(())
 }
 
-/// One model's hygiene lines from the doctor's counters.
-fn print_hygiene(s: &cache::KeyStats) {
+/// One model's hygiene lines from the doctor's counters. `waste` prices the
+/// repairable re-billed prefix when the caller had a rate: the dollars and
+/// whether the row is plan-covered, so subscription waste is framed as
+/// headroom at reference rates instead of billed dollars (plan 019).
+fn print_hygiene(s: &cache::KeyStats, waste: Option<(f64, bool)>) {
     println!(
         "  hygiene: {} requests ({} with cache markers); prefix preserved {}, new-conversation resets {}, diverged {}, past the 5-min TTL {}, below cacheable minimum {}",
         s.requests, s.marked, s.preserved, s.resets, s.diverged, s.ttl_gaps, s.below_min
@@ -2097,6 +2139,16 @@ fn print_hygiene(s: &cache::KeyStats) {
             "  repair: {} requests carried a repeating prefix with no cache marker; {} repaired",
             s.repairable, s.repaired
         );
+        match waste {
+            Some((usd, true)) if usd > 0.0 => println!(
+                "    that re-billed prefix burned ~${usd:.4} of API-equivalent input: \
+                 plan headroom spent on avoidable cache misses"
+            ),
+            Some((usd, false)) if usd > 0.0 => {
+                println!("    that re-billed prefix wasted ~${usd:.4} against cache-read pricing")
+            }
+            _ => {}
+        }
         if s.repaired == 0 {
             println!(
                 "    Decoyrail can inject those markers for you (Pro): set `[cache] repair = true` \
@@ -2104,6 +2156,62 @@ fn print_hygiene(s: &cache::KeyStats) {
             );
         }
     }
+}
+
+/// Declare, show, or clear the local plan price (plan 019). Bare `decoyrail
+/// plan` reads this period's plan-absorbed total against the declared price;
+/// the price is one local setting the user owns, never guessed.
+fn plan_cmd(args: PlanArgs) -> Result<()> {
+    if args.clear {
+        meter::clear_plan_price()?;
+        println!("Plan price cleared.");
+        return Ok(());
+    }
+    let existing = meter::load_plan_price()?;
+    if args.price.is_none() && args.label.is_none() {
+        let mut m = meter::Meter::load()?;
+        m.roll_period(&util::current_period());
+        let absorbed = m.plan_absorbed().max(0.0);
+        match existing {
+            Some(p) => println!("{}", meter::plan_verdict(&p, absorbed)),
+            None => {
+                if absorbed > 0.0 {
+                    println!(
+                        "Plan-absorbed this period: ~${absorbed:.4} API-equivalent \
+                         (subscription traffic, not billed)."
+                    );
+                } else {
+                    println!("No plan-covered traffic this period.");
+                }
+                println!(
+                    "No plan price declared. Set one with \
+                     `decoyrail plan --price 200 --label \"Claude Max\"` to see \
+                     what the plan absorbs against what it costs."
+                );
+            }
+        }
+        return Ok(());
+    }
+    let usd = match (args.price, &existing) {
+        (Some(usd), _) => usd,
+        (None, Some(p)) => p.usd,
+        (None, None) => return Err(anyhow!("no plan price declared yet; pass --price")),
+    };
+    // `<= 0.0` alone would let NaN through; require a real positive number.
+    if usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        return Err(anyhow!(
+            "plan price must be a positive dollar amount; use --clear to remove it"
+        ));
+    }
+    let label = args.label.or(existing.map(|p| p.label)).unwrap_or_default();
+    let price = meter::PlanPrice { usd, label };
+    meter::save_plan_price(&price)?;
+    if price.label.is_empty() {
+        println!("Plan price set: ${usd:.2}/mo.");
+    } else {
+        println!("Plan price set: {} at ${usd:.2}/mo.", price.label);
+    }
+    Ok(())
 }
 
 fn budget_cmd(usd: f64) -> Result<()> {

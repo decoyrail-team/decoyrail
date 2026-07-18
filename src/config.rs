@@ -157,6 +157,12 @@ pub fn pricing_path() -> Result<PathBuf> {
     Ok(home()?.join("pricing.json"))
 }
 
+/// User-declared subscription plan price (plan 019). Its own file with one
+/// writer (`decoyrail plan`), so neither budget nor meter writes touch it.
+pub fn plan_path() -> Result<PathBuf> {
+    Ok(home()?.join("plan.json"))
+}
+
 /// The installed license file (signed, offline; see `license.rs`). Absence is
 /// the defined Free state, so nothing creates this except `license install`.
 pub fn license_path() -> Result<PathBuf> {

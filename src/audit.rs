@@ -83,6 +83,15 @@ pub struct UsageRec {
     #[serde(default)]
     pub cache_write: u64,
     pub cost_usd: f64,
+    /// API-equivalent reference cost for subscription traffic (plan 019):
+    /// what these tokens would have billed at API rates. Zero (and omitted)
+    /// for usage-billed requests; never summed into `cost_usd`.
+    #[serde(default, skip_serializing_if = "ref_is_zero")]
+    pub ref_cost_usd: f64,
+}
+
+fn ref_is_zero(n: &f64) -> bool {
+    *n == 0.0
 }
 
 /// What the caller wants recorded; the auditor stamps seq/ts/hashes.
@@ -737,6 +746,7 @@ mod tests {
                     cache_read: 5000,
                     cache_write: 100,
                     cost_usd: 0.007875,
+                    ref_cost_usd: 0.0,
                 }),
                 ..Default::default()
             },
@@ -794,6 +804,7 @@ mod tests {
                         cache_read: 0,
                         cache_write: 0,
                         cost_usd: 0.007875,
+                        ref_cost_usd: 0.0,
                     }),
                     ..Default::default()
                 },

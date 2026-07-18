@@ -689,13 +689,12 @@ async fn pipeline_inner(
         let token_record = match (provider, usage) {
             (Some(p), Some(u)) => {
                 let rate = engine.pricing.read().await.rate_for(p, model.as_deref());
+                let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
                 Some((
                     crate::pricing::model_key(model.as_deref(), billing),
                     u,
-                    match billing {
-                        crate::pricing::Billing::Subscription => 0.0,
-                        crate::pricing::Billing::Usage => u.cost_usd(&rate),
-                    },
+                    cost,
+                    ref_cost,
                 ))
             }
             _ => None,
@@ -704,7 +703,9 @@ async fn pipeline_inner(
         let mut meter = engine.meter.lock().await;
         meter.record_traffic(&now, host, bytes_up, bytes_down_now);
         match &token_record {
-            Some((key, u, cost)) => meter.record_tokens(&now, host, key, u, *cost),
+            Some((key, u, cost, ref_cost)) => {
+                meter.record_tokens(&now, host, key, u, *cost, *ref_cost)
+            }
             None if !streamed => meter.add_estimated(&now, host, bytes_up + bytes_down_now),
             None => {}
         }
@@ -714,9 +715,10 @@ async fn pipeline_inner(
         // instead, once the counts are known.
         usage_note = token_record
             .as_ref()
-            .map(|(key, u, _)| usage_note_for(key, u))
+            .map(|(key, u, _, _)| usage_note_for(key, u))
             .unwrap_or_default();
-        usage_rec = token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost));
+        usage_rec =
+            token_record.map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost));
     }
     let recorded = audit(
         engine,
@@ -794,6 +796,7 @@ fn usage_rec_for(
     model_key: &str,
     u: &crate::pricing::TokenUsage,
     cost_usd: f64,
+    ref_cost_usd: f64,
 ) -> crate::audit::UsageRec {
     crate::audit::UsageRec {
         model: model_key.to_string(),
@@ -802,6 +805,7 @@ fn usage_rec_for(
         cache_read: u.cache_read,
         cache_write: u.cache_write,
         cost_usd,
+        ref_cost_usd,
     }
 }
 
@@ -914,13 +918,12 @@ impl<S> MeteredStream<S> {
             let token_record = match (provider, scanner.and_then(|s| s.finish())) {
                 (Some(p), Some(u)) => {
                     let rate = engine.pricing.read().await.rate_for(p, model.as_deref());
+                    let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
                     Some((
                         crate::pricing::model_key(model.as_deref(), billing),
                         u,
-                        match billing {
-                            crate::pricing::Billing::Subscription => 0.0,
-                            crate::pricing::Billing::Usage => u.cost_usd(&rate),
-                        },
+                        cost,
+                        ref_cost,
                     ))
                 }
                 _ => None,
@@ -930,7 +933,9 @@ impl<S> MeteredStream<S> {
                 let mut meter = engine.meter.lock().await;
                 meter.add_downstream_bytes(&now, &host, counted);
                 match &token_record {
-                    Some((key, u, cost)) => meter.record_tokens(&now, &host, key, u, *cost),
+                    Some((key, u, cost, ref_cost)) => {
+                        meter.record_tokens(&now, &host, key, u, *cost, *ref_cost)
+                    }
                     None => meter.add_estimated(&now, &host, bytes_up + counted),
                 }
                 let _ = meter.flush(&now);
@@ -948,11 +953,12 @@ impl<S> MeteredStream<S> {
                     action: "usage".into(),
                     note: token_record
                         .as_ref()
-                        .map(|(key, u, _)| usage_note_for(key, u))
+                        .map(|(key, u, _, _)| usage_note_for(key, u))
                         .unwrap_or_default(),
                     dur_ms: Some(dur_ms),
                     bytes_down: counted,
-                    usage: token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost)),
+                    usage: token_record
+                        .map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost)),
                     req_seq,
                     ..Default::default()
                 },
@@ -1352,11 +1358,13 @@ async fn keepalive_fire(
     let usage = provider.and_then(|p| crate::pricing::parse_usage_json(p, &bytes));
     let token_record = match (usage, rate) {
         (Some(u), Some(rate)) => {
-            let cost = match billing {
-                crate::pricing::Billing::Subscription => 0.0,
-                crate::pricing::Billing::Usage => u.cost_usd(&rate),
-            };
-            Some((crate::pricing::model_key(Some(model), billing), u, cost))
+            let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
+            Some((
+                crate::pricing::model_key(Some(model), billing),
+                u,
+                cost,
+                ref_cost,
+            ))
         }
         _ => None,
     };
@@ -1366,13 +1374,15 @@ async fn keepalive_fire(
         let mut meter = engine.meter.lock().await;
         meter.record_traffic(&now, host, bytes_up, bytes_down);
         match &token_record {
-            Some((key, u, cost)) => meter.record_tokens(&now, host, key, u, *cost),
+            Some((key, u, cost, ref_cost)) => {
+                meter.record_tokens(&now, host, key, u, *cost, *ref_cost)
+            }
             None => meter.add_estimated(&now, host, bytes_up + bytes_down),
         }
         let _ = meter.flush(&now);
     }
     let note = match &token_record {
-        Some((key, u, _)) => format!("proxy-initiated pre-warm; {}", usage_note_for(key, u)),
+        Some((key, u, _, _)) => format!("proxy-initiated pre-warm; {}", usage_note_for(key, u)),
         None => "proxy-initiated pre-warm".to_string(),
     };
     audit(
@@ -1393,7 +1403,8 @@ async fn keepalive_fire(
             dur_ms: Some(started.elapsed().as_millis() as u64),
             bytes_up,
             bytes_down,
-            usage: token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost)),
+            usage: token_record
+                .map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost)),
             ..Default::default()
         },
     )

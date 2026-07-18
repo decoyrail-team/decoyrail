@@ -46,7 +46,7 @@ doing and why something was denied.
 | `sid` | session id of the recording process, stable where pids get reused; what `decoyrail stats --by session` groups on |
 | `dur_ms` | request duration in milliseconds; on streamed responses it moves to the companion `usage` event so nothing is measured twice |
 | `bytes_up`, `bytes_down` | request and response sizes as seen at the proxy (omitted when zero) |
-| `usage` | structured token counts and cost for LLM requests: `{model, input, output, cache_read, cache_write, cost_usd}` |
+| `usage` | structured token counts and cost for LLM requests: `{model, input, output, cache_read, cache_write, cost_usd, ref_cost_usd}` (`ref_cost_usd` is the API-equivalent reference for subscription traffic, present only when nonzero) |
 | `req_seq` | on `usage` events: the `seq` of the allow or warn event the counts belong to |
 
 The analytics fields (`sid` through `req_seq`) exist so `decoyrail stats`
@@ -147,10 +147,32 @@ means an OAuth `Authorization: Bearer` with no `x-api-key`, the shape
 Claude Code sends when signed into a Claude plan. Its tokens still show in `status`, in full; they just
 don't burn the budget, because a flat plan adds no per-request bill. That
 isn't the same as free: plan allowances are finite, heavy sessions hit plan
-limits, and usage beyond the plan bills at API rates. An API-equivalent
-reference cost for subscription traffic is on the [roadmap](../ROADMAP.md),
-so you'll be able to see what your plan absorbed and how close you are to
-outgrowing it.
+limits, and usage beyond the plan bills at API rates.
+
+So every subscription request also carries a **reference cost**: what the
+same tokens would have billed at API rates, cache reads and writes priced
+at their own multipliers, from the same pricing table as billed traffic.
+`status` and `stats` show the total as "plan-absorbed", always labeled
+API-equivalent and never summed into spend; the budget and its kill switch
+see only billable dollars. It is a reference, what the plan absorbed, not a
+savings claim: providers don't publish plan allowances, so Decoyrail never
+invents a "percent of plan used".
+
+If you tell Decoyrail what the plan costs, it reads the absorbed total
+against that price:
+
+```sh
+decoyrail plan --price 200 --label "Claude Max"   # declare what you pay
+decoyrail plan          # what the plan absorbed this period, vs its price
+decoyrail plan --clear  # remove the declared price
+```
+
+With a price declared, `status` and `plan` state one of two things: the
+plan absorbed more API-equivalent usage than it costs (it is paying for
+itself), or how much of its headroom went unused this period. With no
+price declared you get the totals and no verdict. The price is a local
+setting you own; if the provider reprices, the declared figure is shown so
+a stale number is visible.
 
 ```sh
 decoyrail status        # tokens + $ per model for LLM hosts, MB for the rest
@@ -168,6 +190,11 @@ what keeps breaking it:
 - hit rate per model, and the dollars cache reads saved against full-price
   input (for subscription traffic: the API-equivalent value, which is plan
   headroom),
+- what repairable cache misses cost: when a repeating prefix keeps
+  re-billing for want of a cache marker, the report prices that waste (a
+  byte-derived estimate, marked `~`). On billed traffic it is wasted
+  dollars; on subscription traffic it is plan headroom spent on avoidable
+  misses, priced at API-equivalent rates,
 - whether requests carry cache markers at all,
 - prefix stability between consecutive requests: preserved, new
   conversation, diverged, or landed past the 5-minute TTL,

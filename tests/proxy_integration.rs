@@ -470,6 +470,21 @@ async fn proxy_end_to_end() {
     let sub = &disk.per_host["localhost"].models["claude-sonnet-5-20250929 [subscription]"];
     assert_eq!(sub.input_tokens, 1000);
     assert_eq!(sub.cost_usd, 0.0);
+    // Plan 019: the same tokens carry their API-equivalent reference cost,
+    // hand-computed at claude-sonnet-5 rates with cache multipliers
+    // (1000*3 + 200*15 + 5000*0.3 + 100*3.75 per mtok), and the reference
+    // dollars never reach billable spend or the budget switch.
+    assert!(
+        (sub.ref_cost_usd - 0.007875).abs() < 1e-9,
+        "reference cost was {}",
+        sub.ref_cost_usd
+    );
+    assert!((disk.plan_absorbed() - 0.007875).abs() < 1e-9);
+    let billable_before_sub_excludes_ref = disk.total_cost();
+    assert!(
+        (billable_before_sub_excludes_ref - 0.007875).abs() < 1e-9,
+        "scenario 10's billed request is the only spend so far; total was {billable_before_sub_excludes_ref}"
+    );
 
     // 12. EXACT METERING (SSE): usage events are scanned out of the stream as
     //     it passes; the meter is updated asynchronously after the stream
@@ -826,6 +841,15 @@ async fn proxy_end_to_end() {
             .expect("subscription model row");
         assert_eq!(sub.stats.requests, 1);
         assert_eq!(sub.stats.cost_usd, 0.0);
+        // The subscription bucket carries the reference figure; the billed
+        // bucket carries none. Separate buckets, nothing shared (plan 019).
+        assert!(
+            (sub.stats.plan_absorbed_usd - 0.007875).abs() < 1e-9,
+            "plan absorbed was {}",
+            sub.stats.plan_absorbed_usd
+        );
+        assert_eq!(billed.stats.plan_absorbed_usd, 0.0);
+        assert!((t.plan_absorbed_usd - 0.007875).abs() < 1e-9);
 
         // Session attribution: one labeled session owns all the traffic.
         assert_eq!(report.by_session.len(), 1);
