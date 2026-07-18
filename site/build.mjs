@@ -344,7 +344,6 @@ const MATRIX = [
     ['Budget soft-landing (downgrade, not dead stop)', ['', 'v0.3', 'v0.3', 'v0.3']],
     ['Prompt-cache repair and keep-alive', ['', 'v0.3', 'v0.3', 'v0.3']],
     ['Model routing by policy', ['', 'v0.3', 'v0.3', 'v0.3']],
-    ['Maintained detector packs', ['', 'v0.5', 'v0.5', 'v0.5']],
   ]},
   { group: 'Fleet', intro: 'One pane of glass once agents run on more machines than yours.', rows: [
     ['Admin console with policy dry-run', ['', '', 'v0.4', 'v0.4']],
@@ -398,7 +397,6 @@ const PLANS = [
       'Budget soft-landing (downgrade, not dead stop)',
       'Prompt-cache repair and keep-alive',
       'Model routing by policy',
-      'Maintained detector packs',
       'Email support',
     ],
     cta: { label: 'Get launch pricing', href: contact('Pro'), primary: true },
