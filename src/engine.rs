@@ -27,6 +27,10 @@ struct ReloadState {
     budget: Option<SystemTime>,
     pricing: Option<SystemTime>,
     license: Option<SystemTime>,
+    /// trip.json's mtime: `decoyrail trip clear` removes the file (and another
+    /// session's detector may write it), and a running proxy must follow both
+    /// without a restart.
+    trip: Option<SystemTime>,
     /// Effective tier as of the last refresh, so crossings (a reload, or an
     /// expiry the clock walked past with no file change) audit exactly once.
     tier: Tier,
@@ -61,6 +65,10 @@ pub struct Engine {
     /// pre-warm budgets (plan 004 phase 3, Pro + opt-in). Templates live in
     /// memory only, never on disk.
     pub keepalive: Arc<Mutex<crate::cache::KeepAlive>>,
+    /// Spend tripwire (plan 002): per-session runaway detection state plus
+    /// the persisted trip in force. A safety feature in the free tier; the
+    /// pipeline consults it like the budget kill switch, never a license.
+    pub watch: Arc<Mutex<crate::watch::Watch>>,
     /// Identifies this process's session (one `decoyrail run` or `proxy`
     /// invocation) in every audit event it writes. Stable where pid is not:
     /// the OS reuses pids, so analytics groups by this instead.
@@ -183,8 +191,15 @@ impl Engine {
             budget: config::mtime(&config::budget_path()?),
             pricing: config::mtime(&config::pricing_path()?),
             license: config::mtime(&config::license_path()?),
+            trip: config::mtime(&config::trip_path()?),
             tier,
         }));
+        // A persisted trip survives a proxy restart on purpose: clearing is
+        // an explicit operator command, never a bounce.
+        let watch = crate::watch::Watch::new(
+            crate::util::now_unix(),
+            crate::watch::load_trip().ok().flatten(),
+        );
 
         Ok(Self {
             ca,
@@ -199,6 +214,7 @@ impl Engine {
             cache: Arc::new(Mutex::new(crate::cache::Doctor::default())),
             fanout: Arc::new(crate::cache::FanoutGate::default()),
             keepalive: Arc::new(Mutex::new(crate::cache::KeepAlive::default())),
+            watch: Arc::new(Mutex::new(watch)),
             session_id: new_session_id(),
             license: Arc::new(RwLock::new(license_doc)),
             default_override: None,
@@ -348,6 +364,16 @@ impl Engine {
                     }
                 }
             }
+        }
+        // The trip file's presence is the state: written by a detector (any
+        // session sharing this home), removed by `decoyrail trip clear`.
+        // load_trip reads an unreadable-but-present file as tripped-unknown,
+        // so a change here can never silently clear an enforcement.
+        let trip_now = config::trip_path().ok().and_then(|p| config::mtime(&p));
+        if trip_now != st.trip {
+            st.trip = trip_now;
+            let trip = crate::watch::load_trip().unwrap_or(None);
+            self.watch.lock().await.set_tripped(trip);
         }
         // Tier crossings audit exactly once, whether driven by a file change
         // above or by the date walking past expiry/grace with no change.
