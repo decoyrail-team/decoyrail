@@ -23,7 +23,7 @@ Not in the product yet: machine-wide capture, the LLM judge, SigV4
 re-signing, SSRF blocking, rate limiting, and any GUI. The phases below cover
 them.
 
-## v0.3: The boundary pays for itself (in progress)
+## v0.3: The boundary pays for itself (shipped: the v0.3.x releases)
 
 *The bar: Decoyrail can show a team, in dollars, what it saved them last
 month, and the number is bigger than its own bill.*
