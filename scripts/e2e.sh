@@ -124,5 +124,56 @@ LINE_OUT=$("$BIN" stats --line)
   && pass "stats --line emits one line ($LINE_OUT)" || fail "stats --line malformed: $LINE_OUT"
 "$BIN" stats --json | grep -q '"schema": 1' && pass "stats --json is schema v1" || fail "stats --json missing schema"
 
+# 9. POLICY INTEGRITY: an out-of-band edit never loads. The running proxy
+#    keeps the last good policy and raises the tamper alarm; a fresh start
+#    refuses; blessing demands a TTY; a byte-identical restore just works.
+cp "$HOME_DIR/policy.toml" "$HOME_DIR/policy.orig"
+printf '# tampered out-of-band\n' >> "$HOME_DIR/policy.toml"
+
+"$BIN" policy ls | grep -q "NOT TRUSTED" \
+  && pass "policy ls reports the hand-edited file as untrusted" \
+  || fail "policy ls missed the tamper"
+
+if "$BIN" policy sign </dev/null >/dev/null 2>&1; then
+  fail "policy sign must refuse without a TTY"
+else
+  pass "policy sign refuses without a TTY"
+fi
+
+# The next request makes the running proxy re-check the file: it must keep
+# enforcing the last good policy (the swap still works) and write the
+# distinct tamper event.
+ECHO=$(curl -s -m 15 -x "$PROXY" --cacert "$CA" "$UP/headers" -H "x-secret: $DECOY_SVC")
+grep -q "$REAL" <<<"$ECHO" && pass "running proxy kept the last good policy" \
+  || fail "proxy behavior changed under a rejected policy"
+grep -q '"action":"tamper"' "$HOME_DIR/audit.jsonl" \
+  && pass "tamper event recorded in the audit log" \
+  || fail "no tamper event in the audit log"
+LOG_TAIL=$("$BIN" log -n 20)
+grep -q '\[TAMP\]' <<<"$LOG_TAIL" \
+  && pass "live log renders the tamper with alarm prominence" \
+  || { echo "$LOG_TAIL"; fail "no [TAMP] line in the log"; }
+
+# Started in the background so a wrongly-successful boot can't hang the
+# script: alive after a second means it started, which is the failure.
+"$BIN" proxy --addr "127.0.0.1:$((PORT+2))" >/dev/null 2>&1 &
+BOOT_PID=$!
+sleep 1
+if kill -0 "$BOOT_PID" 2>/dev/null; then
+  kill "$BOOT_PID" 2>/dev/null; wait "$BOOT_PID" 2>/dev/null || true
+  fail "a fresh proxy must refuse to start on a tampered policy"
+else
+  wait "$BOOT_PID" 2>/dev/null || true
+  pass "fresh proxy start fails closed on the tampered policy"
+fi
+
+cp "$HOME_DIR/policy.orig" "$HOME_DIR/policy.toml" && rm "$HOME_DIR/policy.orig"
+ECHO=$(curl -s -m 15 -x "$PROXY" --cacert "$CA" "$UP/headers" -H "x-secret: $DECOY_SVC")
+grep -q "$REAL" <<<"$ECHO" && pass "byte-identical restore loads with no blessing" \
+  || fail "restored policy did not load"
+"$BIN" policy ls | grep -q "integrity: trusted" \
+  && pass "policy ls reports the restored file as trusted" \
+  || fail "restored file not reported trusted"
+
 echo "== all e2e checks passed =="
 "$BIN" status

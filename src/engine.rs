@@ -19,9 +19,18 @@ use crate::vault::Vault;
 struct ReloadState {
     vault: Option<SystemTime>,
     policy: Option<SystemTime>,
+    /// The policy integrity record's mtime, watched as a pair with the
+    /// policy's own: deleting or rewriting the record alone (the file
+    /// untouched) must re-verify and trip the tamper alarm, and a blessing
+    /// (`policy sign` touches only the record) must load the blessed file.
+    policy_sig: Option<SystemTime>,
     budget: Option<SystemTime>,
     pricing: Option<SystemTime>,
     license: Option<SystemTime>,
+    /// trip.json's mtime: `decoyrail trip clear` removes the file (and another
+    /// session's detector may write it), and a running proxy must follow both
+    /// without a restart.
+    trip: Option<SystemTime>,
     /// Effective tier as of the last refresh, so crossings (a reload, or an
     /// expiry the clock walked past with no file change) audit exactly once.
     tier: Tier,
@@ -56,6 +65,10 @@ pub struct Engine {
     /// pre-warm budgets (plan 004 phase 3, Pro + opt-in). Templates live in
     /// memory only, never on disk.
     pub keepalive: Arc<Mutex<crate::cache::KeepAlive>>,
+    /// Spend tripwire (plan 002): per-session runaway detection state plus
+    /// the persisted trip in force. A safety feature in the free tier; the
+    /// pipeline consults it like the budget kill switch, never a license.
+    pub watch: Arc<Mutex<crate::watch::Watch>>,
     /// Identifies this process's session (one `decoyrail run` or `proxy`
     /// invocation) in every audit event it writes. Stable where pid is not:
     /// the OS reuses pids, so analytics groups by this instead.
@@ -88,18 +101,33 @@ fn new_session_id() -> String {
 impl Engine {
     pub fn boot() -> Result<Self> {
         let ca = Arc::new(CertAuthority::load_or_create()?);
-        let vault = Arc::new(RwLock::new(Vault::load_or_init()?));
-        let policy = Arc::new(RwLock::new(Policy::load_or_default()?));
-        // Boot-time sanity pass over allow_secrets (see refresh() for the
-        // reload-time counterpart). try_read never fails on the locks we just
-        // created and works both inside and outside a tokio runtime.
-        if let (Ok(v), Ok(p)) = (vault.try_read(), policy.try_read()) {
-            for w in p.lint(&v.secrets) {
-                eprintln!("decoyrail: policy warning: {w}");
+        let vault = Vault::load_or_init()?;
+        // Only a policy Decoyrail wrote or blessed loads. An unverifiable one
+        // is a hard, instructive refusal to start; the refusal itself goes in
+        // the tamper-evident log, not just stderr.
+        let policy = match Policy::load_trusted() {
+            Ok(p) => p,
+            Err(crate::policy::LoadError::Untrusted(msg)) => {
+                note_tamper_at_boot(&msg);
+                return Err(anyhow::anyhow!(msg));
             }
-        }
+            Err(crate::policy::LoadError::Other(e)) => return Err(e),
+        };
         let meter = Arc::new(Mutex::new(SessionMeter::load()?));
-        let pricing = Arc::new(RwLock::new(Pricing::load()?));
+        let pricing = Pricing::load()?;
+        // Boot-time sanity pass over allow_secrets and route maps (see
+        // refresh() for the reload-time counterpart), before the values move
+        // behind their locks.
+        for w in policy
+            .lint(&vault.secrets)
+            .into_iter()
+            .chain(policy.lint_routes(&pricing))
+        {
+            eprintln!("decoyrail: policy warning: {w}");
+        }
+        let vault = Arc::new(RwLock::new(vault));
+        let policy = Arc::new(RwLock::new(policy));
+        let pricing = Arc::new(RwLock::new(pricing));
         let auditor = Arc::new(Mutex::new(Auditor::open()?));
         let dlp_salt = crate::detect::load_or_create_salt()?;
         // Upstream client. No proxy (we ARE the proxy) — and explicitly so:
@@ -163,11 +191,19 @@ impl Engine {
         let reload = Arc::new(Mutex::new(ReloadState {
             vault: config::mtime(&config::vault_path()?),
             policy: config::mtime(&config::policy_path()?),
+            policy_sig: config::mtime(&config::policy_sig_path()?),
             budget: config::mtime(&config::budget_path()?),
             pricing: config::mtime(&config::pricing_path()?),
             license: config::mtime(&config::license_path()?),
+            trip: config::mtime(&config::trip_path()?),
             tier,
         }));
+        // A persisted trip survives a proxy restart on purpose: clearing is
+        // an explicit operator command, never a bounce.
+        let watch = crate::watch::Watch::new(
+            crate::util::now_unix(),
+            crate::watch::load_trip().ok().flatten(),
+        );
 
         Ok(Self {
             ca,
@@ -182,6 +218,7 @@ impl Engine {
             cache: Arc::new(Mutex::new(crate::cache::Doctor::default())),
             fanout: Arc::new(crate::cache::FanoutGate::default()),
             keepalive: Arc::new(Mutex::new(crate::cache::KeepAlive::default())),
+            watch: Arc::new(Mutex::new(watch)),
             session_id: new_session_id(),
             license: Arc::new(RwLock::new(license_doc)),
             default_override: None,
@@ -251,11 +288,13 @@ impl Engine {
                 }
             }
         }
-        if let Ok(path) = config::policy_path() {
+        if let (Ok(path), Ok(sig_path)) = (config::policy_path(), config::policy_sig_path()) {
             let now = config::mtime(&path);
-            if now != st.policy {
+            let sig_now = config::mtime(&sig_path);
+            if now != st.policy || sig_now != st.policy_sig {
                 st.policy = now;
-                match Policy::load_or_default() {
+                st.policy_sig = sig_now;
+                match Policy::load_trusted() {
                     Ok(mut p) => {
                         // The operator's session override outlives file edits;
                         // rules change as usual, the default stays pinned.
@@ -272,12 +311,23 @@ impl Engine {
                             known.extend(self.session.secrets.iter().cloned());
                             known
                         };
-                        for w in p.lint(&known) {
+                        let route_warnings = p.lint_routes(&*self.pricing.read().await);
+                        for w in p.lint(&known).into_iter().chain(route_warnings) {
                             eprintln!("decoyrail: policy warning: {w}");
                         }
                         *self.policy.write().await = p;
                     }
-                    Err(e) => self.reload_failed("policy", &e).await,
+                    // Tampering is its own audit story (`tamper`, alarm
+                    // prominence downstream), distinct from the typo path
+                    // below. Either way the last good policy stays active.
+                    Err(crate::policy::LoadError::Untrusted(msg)) => {
+                        let note = format!("policy rejected; previous policy stays active: {msg}");
+                        eprintln!("decoyrail: ALERT: {note}");
+                        self.audit_note("tamper", note).await;
+                    }
+                    Err(crate::policy::LoadError::Other(e)) => {
+                        self.reload_failed("policy", &e).await
+                    }
                 }
             }
         }
@@ -318,6 +368,16 @@ impl Engine {
                     }
                 }
             }
+        }
+        // The trip file's presence is the state: written by a detector (any
+        // session sharing this home), removed by `decoyrail trip clear`.
+        // load_trip reads an unreadable-but-present file as tripped-unknown,
+        // so a change here can never silently clear an enforcement.
+        let trip_now = config::trip_path().ok().and_then(|p| config::mtime(&p));
+        if trip_now != st.trip {
+            st.trip = trip_now;
+            let trip = crate::watch::load_trip().unwrap_or(None);
+            self.watch.lock().await.set_tripped(trip);
         }
         // Tier crossings audit exactly once, whether driven by a file change
         // above or by the date walking past expiry/grace with no change.
@@ -364,6 +424,22 @@ impl Engine {
         if let Err(e) = self.auditor.lock().await.append(entry, ts) {
             eprintln!("decoyrail: audit append failed: {e:#}");
         }
+    }
+}
+
+/// Best-effort tamper note when there is no running engine to audit through
+/// (the boot refusal). The refusal itself must not be masked by an audit
+/// failure, so errors here go to stderr and nowhere else.
+fn note_tamper_at_boot(msg: &str) {
+    let res = Auditor::open().and_then(|mut a| {
+        a.append(
+            crate::audit::Entry::note("tamper", format!("proxy refused to start: {msg}")),
+            crate::util::now_rfc3339(),
+        )
+        .map(|_| ())
+    });
+    if let Err(e) = res {
+        eprintln!("decoyrail: audit append failed: {e:#}");
     }
 }
 
@@ -444,6 +520,110 @@ mod tests {
         std::env::remove_var("DECOYRAIL_HOME");
     }
 
+    /// Plan 018: an out-of-band policy edit never loads. A running proxy
+    /// keeps the last good policy and writes the distinct `tamper` event; a
+    /// blessing (which touches only the record file) is picked up live; and
+    /// a fresh boot against the tampered file refuses to start,
+    /// instructively.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn tampered_policy_keeps_last_good_audits_and_blocks_boot() {
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+
+        use crate::policy::Action;
+        let evaluate =
+            |p: &crate::policy::Policy| p.evaluate("evil.example.com", "/", "GET").action;
+
+        // Boot materializes a trusted default, then a CLI write flips the
+        // default action; the hot reload follows because the write is
+        // recorded.
+        let engine = Engine::boot().unwrap();
+        crate::policy_edit::write_policy("default_action = \"allow\"\n", "test").unwrap();
+        engine.refresh().await;
+        assert_eq!(evaluate(&*engine.policy.read().await), Action::Allow);
+
+        // Out-of-band edit: rejected, last good stays, tamper event lands.
+        let path = config::policy_path().unwrap();
+        std::fs::write(&path, "default_action = \"deny\"\n").unwrap();
+        engine.refresh().await;
+        assert_eq!(
+            evaluate(&*engine.policy.read().await),
+            Action::Allow,
+            "a tampered policy must not replace the running one"
+        );
+        let log = std::fs::read_to_string(config::audit_path().unwrap()).unwrap();
+        assert!(log.contains("\"tamper\""), "tamper event missing: {log}");
+
+        // Blessing rewrites only the record; the reload watches its mtime
+        // too, so the blessed hand-edit takes effect without a restart.
+        crate::integrity::bless_current().unwrap();
+        engine.refresh().await;
+        assert_eq!(evaluate(&*engine.policy.read().await), Action::Deny);
+
+        // An unreadable record is the ordinary broken-file story (`alert`,
+        // not `tamper`): the last good policy stays, boot fails plainly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sig = config::policy_sig_path().unwrap();
+            std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Same bytes, fresh mtime: only the record read can fail.
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            engine.refresh().await;
+            assert_eq!(evaluate(&*engine.policy.read().await), Action::Deny);
+            let log = std::fs::read_to_string(config::audit_path().unwrap()).unwrap();
+            assert!(log.contains("policy reload failed"), "{log}");
+            assert!(
+                Engine::boot().is_err(),
+                "boot must fail on an unreadable record"
+            );
+            std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // A new boot against a tampered file is a hard, instructive no.
+        std::fs::write(&path, "default_action = \"allow\"\n# extra\n").unwrap();
+        let err = Engine::boot()
+            .err()
+            .expect("boot must refuse a tampered policy")
+            .to_string();
+        assert!(err.contains("policy sign"), "{err}");
+        let log = std::fs::read_to_string(config::audit_path().unwrap()).unwrap();
+        assert!(log.contains("proxy refused to start"), "{log}");
+
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
+
+    /// The boot-refusal audit note is best-effort: it lands in the log when
+    /// the log is writable, and degrades to stderr (never masking the
+    /// refusal) when it is not.
+    #[test]
+    fn boot_tamper_note_is_best_effort() {
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+        config::ensure_home().unwrap();
+
+        note_tamper_at_boot("test message");
+        let log = std::fs::read_to_string(config::audit_path().unwrap()).unwrap();
+        assert!(log.contains("proxy refused to start: test message"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let audit = config::audit_path().unwrap();
+            std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o444)).unwrap();
+            note_tamper_at_boot("unwritable log"); // must not panic or mask
+            std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let log = std::fs::read_to_string(&audit).unwrap();
+            assert!(!log.contains("unwritable log"));
+        }
+
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
+
     /// Watch mode (plan 017): the session override pins the default action to
     /// warn, a policy hot-reload keeps the pin while its rule changes land,
     /// and the policy file itself is never modified.
@@ -456,7 +636,7 @@ mod tests {
         std::env::set_var("DECOYRAIL_HOME", tmp.path());
 
         let path = config::policy_path().unwrap();
-        std::fs::write(&path, "default_action = \"deny\"\n").unwrap();
+        crate::policy_edit::write_policy("default_action = \"deny\"\n", "test").unwrap();
         let before = std::fs::read(&path).unwrap();
 
         let mut engine = Engine::boot().unwrap();
@@ -476,10 +656,10 @@ mod tests {
 
         // A mid-session policy edit lands its rules but cannot displace the
         // operator's explicit override.
-        std::fs::write(
-            &path,
+        crate::policy_edit::write_policy(
             "default_action = \"deny\"\n\
              [[rule]]\nname = \"blocked\"\nhosts = [\"evil.example.com\"]\naction = \"deny\"\n",
+            "test",
         )
         .unwrap();
         let f = std::fs::OpenOptions::new()

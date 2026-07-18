@@ -215,23 +215,26 @@ async fn pipeline_inner(
     engine.refresh().await;
 
     // 1. Policy decision on destination (and the DLP detector modes plus the
-    //    prompt-cache knobs, read under the same lock so one request sees one
-    //    consistent policy).
-    let (decision, dlp_cfg, cache_cfg) = {
+    //    prompt-cache, soft-landing, and spend-tripwire knobs, read under the
+    //    same lock so one request sees one consistent policy).
+    let (decision, dlp_cfg, cache_cfg, soft_cfg, trip_cfg) = {
         let policy = engine.policy.read().await;
         (
             policy.evaluate(host, &path, &method),
             policy.dlp.clone(),
             policy.cache.clone(),
+            policy.soft_landing.clone(),
+            policy.spend_tripwire.clone(),
         )
     };
 
-    // 2. Budget kill switch (global: merged spend from all sessions plus ours).
-    let over_budget = engine
-        .meter
-        .lock()
-        .await
-        .over_budget(&crate::util::current_period());
+    // 2. Budget kill switch (global: merged spend from all sessions plus
+    //    ours), and the spend fraction the soft-landing band check reads.
+    let (over_budget, budget_pct) = {
+        let mut meter = engine.meter.lock().await;
+        let now = crate::util::current_period();
+        (meter.over_budget(&now), meter.budget_used_pct(&now))
+    };
 
     // 3. Buffer the request body (prompts are small; enables body swap),
     //    bounded so a runaway client can't exhaust proxy memory.
@@ -265,6 +268,196 @@ async fn pipeline_inner(
         Err(e) => return Err(anyhow!("reading request body: {e}")),
     };
 
+    // 3.35. Spend tripwire (plan 002): identify LLM-bound requests by a
+    //       salted fingerprint of destination + method + pre-swap body (the
+    //       bytes as the agent sent them, before any rewrite below can vary
+    //       them) and run the runaway detectors — the same request repeated
+    //       past the policy's threshold inside its window, or a spend rate
+    //       far above the session's own baseline. A trip persists to
+    //       trip.json until `decoyrail trip clear` (a restart is not a
+    //       clear), and in block mode denies LLM-bound traffic below with
+    //       the same precedence family as the budget kill switch; non-LLM
+    //       egress keeps flowing either way. Alert mode records the onset
+    //       and keeps forwarding. This is a free-tier safety verb: no
+    //       license read anywhere near it.
+    let provider = engine.pricing.read().await.provider_for_host(host);
+    let fp = provider
+        .is_some()
+        .then(|| crate::watch::fingerprint(&engine.dlp_salt, host, &path, &method, &body_bytes));
+    let mut spend_trip: Option<crate::watch::Trip> = None;
+    let mut trip_onset = false;
+    if let Some(fp) = &fp {
+        let mut watch = engine.watch.lock().await;
+        if let Some(t) = watch.tripped() {
+            spend_trip = Some(t.clone());
+        } else if let Some(sig) = watch.observe(&trip_cfg, crate::util::now_unix(), fp) {
+            let trip = sig.to_trip(
+                trip_cfg.window_secs,
+                crate::util::now_rfc3339(),
+                engine.session_id.clone(),
+            );
+            watch.set_tripped(Some(trip.clone()));
+            // Persist so the trip outlives this process and reaches the
+            // other sessions sharing this home. A failed write still trips
+            // this session (the in-memory state above), just not durably.
+            if let Err(e) = crate::watch::save_trip(&trip) {
+                eprintln!("decoyrail: warning: could not persist spend trip: {e:#}");
+            }
+            spend_trip = Some(trip);
+            trip_onset = true;
+        }
+    }
+    let spend_block = spend_trip.is_some() && trip_cfg.mode == crate::policy::TripwireMode::Block;
+    if trip_onset && !spend_block {
+        // Alert mode: the trip is news exactly once, not per request; the
+        // traffic keeps forwarding below.
+        let trip = spend_trip.as_ref().expect("onset implies a trip");
+        audit(
+            engine,
+            Entry {
+                host: host.into(),
+                path: path.clone(),
+                method: method.clone(),
+                action: "alert".into(),
+                rule: decision.rule.clone(),
+                note: format!(
+                    "spend tripwire: {} (alert mode: forwarding continues; \
+                     clear with `decoyrail trip clear`)",
+                    trip.reason
+                ),
+                fp: fp.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    // 3.4. Budget soft-landing (plan 003, Pro + policy opt-in): in the band
+    //      between the policy's threshold and the hard limit, rewrite the
+    //      requested model to the cheaper one the downgrade map names. Runs
+    //      before the doctor, the accounting parse, and the swap, so every
+    //      later step sees exactly the body that forwards; at 100% the kill
+    //      switch below still denies, unchanged. The tier read gates only
+    //      this paid convenience, never a security verb — with no Pro
+    //      license, no configured table, or no mapped model, the bytes pass
+    //      through untouched and only the hard limit remains. Subscription
+    //      traffic never feeds the band: `budget_used_pct` counts billable
+    //      dollars only. The downgrade is never silent: an audit event here,
+    //      a response header below.
+    let mut downgrade_header: Option<String> = None;
+    if soft_cfg.enabled()
+        && provider.is_some()
+        && !over_budget
+        && !spend_block
+        && matches!(
+            decision.action,
+            Action::Allow | Action::Warn | Action::Route
+        )
+        && budget_pct.is_some_and(|pct| pct >= soft_cfg.threshold_pct)
+        && engine.tier().await >= crate::license::Tier::Pro
+    {
+        if let Some(rw) = crate::softland::rewrite_model(&body_bytes, &soft_cfg.map) {
+            body_bytes = rw.body;
+            let pct = budget_pct.unwrap_or(0.0);
+            // A model rewrite invalidates the provider's prompt cache (caches
+            // are model-scoped), so the note says so and the cost math stays
+            // honest. A target model the pricing table doesn't know forwards
+            // as configured (the provider errors informatively) but is
+            // flagged: it is likely a typo in the map.
+            let mut note = format!(
+                "budget soft-landing: model {} -> {} at {pct:.0}% of budget; \
+                 provider prompt cache invalidated (caches are model-scoped)",
+                rw.from, rw.to
+            );
+            if !engine.pricing.read().await.knows_model(&rw.to) {
+                note.push_str("; target model not in the pricing table");
+            }
+            downgrade_header = Some(format!("{} -> {}", rw.from, rw.to));
+            audit(
+                engine,
+                Entry {
+                    host: host.into(),
+                    path: path.clone(),
+                    method: method.clone(),
+                    action: "downgrade".into(),
+                    rule: decision.rule.clone(),
+                    note,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    }
+
+    // 3.45. Model router (plan 006, Pro + a winning `route` rule): rewrite
+    //       the requested model per the rule's explicit map. Runs after the
+    //       soft-landing step, so in the budget band the map applies to the
+    //       model actually about to forward (both rewrites audit
+    //       independently), and before the doctor, the accounting parse, and
+    //       the swap, so every later step sees the body that forwards.
+    //       Security verbs outrank it exactly as they outrank an allow: a
+    //       deny rule never reaches here, the over-budget kill switch is
+    //       checked before the rewrite, and a tripwire or DLP block below
+    //       still denies. The tier read gates only the paid rewrite, never
+    //       reachability — without Pro the rule still allows and the bytes
+    //       ride through untouched. A rule with no map, or a request whose
+    //       model is absent, unmapped, or unidentifiable, forwards
+    //       unmodified: never an error, never a guess. The rewrite is never
+    //       silent: a `route` audit event here (pricing any warm prompt
+    //       cache it forfeits — caches are model-scoped — from the doctor's
+    //       state for the original model), a response header below.
+    let mut route_header: Option<String> = None;
+    if let (Action::Route, Some(prov)) = (decision.action, provider) {
+        if !over_budget && !spend_block && engine.tier().await >= crate::license::Tier::Pro {
+            if let Some(rw) = crate::softland::rewrite_model(&body_bytes, &decision.route) {
+                body_bytes = rw.body;
+                let mut note = format!(
+                    "route: model {} -> {}; provider prompt cache invalidated \
+                     (caches are model-scoped)",
+                    rw.from, rw.to
+                );
+                // Cache-aware routing: when the doctor knows a warm cacheable
+                // prefix for the original model on this host, the note prices
+                // what the rewrite forfeits — that prefix re-bills at the
+                // full input rate instead of the cache-read rate.
+                let warm = engine.cache.lock().await.warm_prefix_bytes(
+                    host,
+                    &rw.from,
+                    crate::util::now_unix(),
+                );
+                if let Some(bytes) = warm {
+                    let rate = engine.pricing.read().await.rate_for(prov, Some(&rw.from));
+                    let waste = crate::cache::repairable_waste_usd(bytes, &rate);
+                    note.push_str(&format!(
+                        "; forfeits a warm {bytes}-byte cached prefix for {} \
+                         (~${waste:.4} re-bills at the full input rate)",
+                        rw.from
+                    ));
+                }
+                // A target the pricing table doesn't know forwards as
+                // configured (the provider errors informatively) but is
+                // flagged: it is likely a typo in the map.
+                if !engine.pricing.read().await.knows_model(&rw.to) {
+                    note.push_str("; target model not in the pricing table");
+                }
+                route_header = Some(format!("{} -> {}", rw.from, rw.to));
+                audit(
+                    engine,
+                    Entry {
+                        host: host.into(),
+                        path: path.clone(),
+                        method: method.clone(),
+                        action: "route".into(),
+                        rule: decision.rule.clone(),
+                        note,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
     // 3.5. Prompt-cache doctor (observe-only, plan 004): diagnose cache
     //      hygiene on the pre-swap body, so nothing the doctor keeps ever
     //      derives from a real secret. Anthropic protocol only (OpenAI's
@@ -274,10 +467,10 @@ async fn pipeline_inner(
     //      Tripwire/DLP overrides below aren't known yet; both are rare on a
     //      provider-bound request and cost one noisy comparison, not a
     //      mutation. The parsed model is reused by the accounting step.
-    let provider = engine.pricing.read().await.provider_for_host(host);
     let cache_active = provider == Some(crate::pricing::Provider::Anthropic)
-        && decision.action == Action::Allow
-        && !over_budget;
+        && matches!(decision.action, Action::Allow | Action::Route)
+        && !over_budget
+        && !spend_block;
     // Cache repair and active management are Pro conveniences; the tier read
     // never gates a security verb (SPEC invariant), only these paid features.
     let pro = cache_active
@@ -424,6 +617,19 @@ async fn pipeline_inner(
         (Action::Deny, format!("dlp: {}{dump_note}", dlp.summary()))
     } else if over_budget {
         (Action::Deny, "budget exhausted".to_string())
+    } else if spend_block {
+        let trip = spend_trip.as_ref().expect("spend_block implies a trip");
+        (
+            Action::Deny,
+            format!(
+                "spend tripwire: {} (clear with `decoyrail trip clear`)",
+                trip.reason
+            ),
+        )
+    } else if decision.action == Action::Route {
+        // A route rule forwards and audits exactly like allow; the rewrite
+        // (when one happened) already wrote its own `route` event above.
+        (Action::Allow, String::new())
     } else {
         (decision.action, String::new())
     };
@@ -455,6 +661,7 @@ async fn pipeline_inner(
                 note: note.clone(),
                 dur_ms: Some(started.elapsed().as_millis() as u64),
                 bytes_up: ctx.body.len() as u64,
+                fp,
                 ..Default::default()
             },
         )
@@ -463,6 +670,13 @@ async fn pipeline_inner(
         // offset, so a coding agent can fix its own request and retry.
         if !outcome.tripped() && dlp.has_blocking() {
             return Ok(dlp_deny_response(&dlp));
+        }
+        // A spend-tripwire block explains its trigger the same way, so an
+        // agent stuck in the loop can read why and break out of it.
+        if !outcome.tripped() && !over_budget && spend_block {
+            return Ok(trip_deny_response(
+                spend_trip.as_ref().expect("spend_block implies a trip"),
+            ));
         }
         return Ok(deny_response(
             StatusCode::FORBIDDEN,
@@ -580,6 +794,15 @@ async fn pipeline_inner(
     if let Some(h) = &cache_header {
         builder = builder.header("x-decoyrail-cache", h.as_str());
     }
+    // Same rule for a soft-landing downgrade (plan 003): degraded traffic
+    // announces itself, so silent quality loss can't erode trust.
+    if let Some(h) = &downgrade_header {
+        builder = builder.header("x-decoyrail-downgrade", h.as_str());
+    }
+    // And for a routed model (plan 006): the rewrite is never silent.
+    if let Some(h) = &route_header {
+        builder = builder.header("x-decoyrail-route", h.as_str());
+    }
 
     // SSE streams pass through untouched (latency-critical). Every other
     // response is buffered up to SCAN_CAP and scanned for echoed real secrets —
@@ -685,17 +908,17 @@ async fn pipeline_inner(
     // both the downstream size and the cost to MeteredStream's completion.
     let usage_note;
     let usage_rec;
+    let billed_usd;
     {
         let token_record = match (provider, usage) {
             (Some(p), Some(u)) => {
                 let rate = engine.pricing.read().await.rate_for(p, model.as_deref());
+                let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
                 Some((
                     crate::pricing::model_key(model.as_deref(), billing),
                     u,
-                    match billing {
-                        crate::pricing::Billing::Subscription => 0.0,
-                        crate::pricing::Billing::Usage => u.cost_usd(&rate),
-                    },
+                    cost,
+                    ref_cost,
                 ))
             }
             _ => None,
@@ -704,7 +927,9 @@ async fn pipeline_inner(
         let mut meter = engine.meter.lock().await;
         meter.record_traffic(&now, host, bytes_up, bytes_down_now);
         match &token_record {
-            Some((key, u, cost)) => meter.record_tokens(&now, host, key, u, *cost),
+            Some((key, u, cost, ref_cost)) => {
+                meter.record_tokens(&now, host, key, u, *cost, *ref_cost)
+            }
             None if !streamed => meter.add_estimated(&now, host, bytes_up + bytes_down_now),
             None => {}
         }
@@ -714,9 +939,23 @@ async fn pipeline_inner(
         // instead, once the counts are known.
         usage_note = token_record
             .as_ref()
-            .map(|(key, u, _)| usage_note_for(key, u))
+            .map(|(key, u, _, _)| usage_note_for(key, u))
             .unwrap_or_default();
-        usage_rec = token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost));
+        billed_usd = token_record
+            .as_ref()
+            .map(|(_, _, cost, _)| *cost)
+            .unwrap_or(0.0);
+        usage_rec =
+            token_record.map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost));
+    }
+    // Feed the spend-rate detector (plan 002) with the billable dollars this
+    // request just metered, outside the meter lock.
+    if billed_usd > 0.0 {
+        engine
+            .watch
+            .lock()
+            .await
+            .observe_cost(crate::util::now_unix(), billed_usd);
     }
     let recorded = audit(
         engine,
@@ -739,6 +978,7 @@ async fn pipeline_inner(
             bytes_up,
             bytes_down: bytes_down_now,
             usage: usage_rec,
+            fp,
             ..Default::default()
         },
     )
@@ -794,6 +1034,7 @@ fn usage_rec_for(
     model_key: &str,
     u: &crate::pricing::TokenUsage,
     cost_usd: f64,
+    ref_cost_usd: f64,
 ) -> crate::audit::UsageRec {
     crate::audit::UsageRec {
         model: model_key.to_string(),
@@ -802,6 +1043,7 @@ fn usage_rec_for(
         cache_read: u.cache_read,
         cache_write: u.cache_write,
         cost_usd,
+        ref_cost_usd,
     }
 }
 
@@ -914,13 +1156,12 @@ impl<S> MeteredStream<S> {
             let token_record = match (provider, scanner.and_then(|s| s.finish())) {
                 (Some(p), Some(u)) => {
                     let rate = engine.pricing.read().await.rate_for(p, model.as_deref());
+                    let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
                     Some((
                         crate::pricing::model_key(model.as_deref(), billing),
                         u,
-                        match billing {
-                            crate::pricing::Billing::Subscription => 0.0,
-                            crate::pricing::Billing::Usage => u.cost_usd(&rate),
-                        },
+                        cost,
+                        ref_cost,
                     ))
                 }
                 _ => None,
@@ -930,10 +1171,25 @@ impl<S> MeteredStream<S> {
                 let mut meter = engine.meter.lock().await;
                 meter.add_downstream_bytes(&now, &host, counted);
                 match &token_record {
-                    Some((key, u, cost)) => meter.record_tokens(&now, &host, key, u, *cost),
+                    Some((key, u, cost, ref_cost)) => {
+                        meter.record_tokens(&now, &host, key, u, *cost, *ref_cost)
+                    }
                     None => meter.add_estimated(&now, &host, bytes_up + counted),
                 }
                 let _ = meter.flush(&now);
+            }
+            // Streamed spend reaches the rate detector (plan 002) here, once
+            // the counts exist — the same feed buffered responses get inline.
+            let billed_usd = token_record
+                .as_ref()
+                .map(|(_, _, cost, _)| *cost)
+                .unwrap_or(0.0);
+            if billed_usd > 0.0 {
+                engine
+                    .watch
+                    .lock()
+                    .await
+                    .observe_cost(crate::util::now_unix(), billed_usd);
             }
             // The allow event was written when the stream started, before the
             // token counts (and final size/duration) existed; this companion
@@ -948,11 +1204,12 @@ impl<S> MeteredStream<S> {
                     action: "usage".into(),
                     note: token_record
                         .as_ref()
-                        .map(|(key, u, _)| usage_note_for(key, u))
+                        .map(|(key, u, _, _)| usage_note_for(key, u))
                         .unwrap_or_default(),
                     dur_ms: Some(dur_ms),
                     bytes_down: counted,
-                    usage: token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost)),
+                    usage: token_record
+                        .map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost)),
                     req_seq,
                     ..Default::default()
                 },
@@ -1118,6 +1375,34 @@ fn dlp_deny_response(dlp: &crate::detect::DlpOutcome) -> Response<ResBody> {
         .expect("static dlp deny response is always valid")
 }
 
+/// The spend tripwire's block body: machine-readable, naming the trigger and
+/// counts and how to clear, so a coding agent stuck in the loop can read why
+/// its requests stopped and break out on its own.
+fn trip_deny_response(trip: &crate::watch::Trip) -> Response<ResBody> {
+    let body = serde_json::json!({
+        "decoyrail": true,
+        "blocked": true,
+        "reason": "spend_tripwire",
+        "trigger": {
+            "kind": trip.kind,
+            "fingerprint": trip.fingerprint,
+            "count": trip.count,
+            "window_secs": trip.window_secs,
+        },
+        "message": format!(
+            "decoyrail blocked this request: spend tripwire ({}). Stop repeating \
+             this request; a human can clear the trip with `decoyrail trip clear`.",
+            trip.reason
+        ),
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .expect("static trip deny response is always valid")
+}
+
 fn deny_response(status: StatusCode, msg: &str) -> Response<ResBody> {
     let body =
         serde_json::json!({ "decoyrail": true, "blocked": true, "message": msg }).to_string();
@@ -1278,12 +1563,24 @@ async fn keepalive_fire(
     let Some(body) = minimize_body(&tmpl.body) else {
         return;
     };
-    let decision = engine
-        .policy
-        .read()
-        .await
-        .evaluate(host, &tmpl.path, &tmpl.method);
-    if decision.action != Action::Allow {
+    let (decision, trip_mode) = {
+        let policy = engine.policy.read().await;
+        (
+            policy.evaluate(host, &tmpl.path, &tmpl.method),
+            policy.spend_tripwire.mode,
+        )
+    };
+    // A route rule allows (the template body already carries whatever model
+    // the pipeline forwarded), so a pre-warm rides it like any allow.
+    if !matches!(decision.action, Action::Allow | Action::Route) {
+        return;
+    }
+    // A standing spend trip (plan 002) stops proxy-initiated spend too: the
+    // quiet recurring cost of a pre-warm is exactly what a tripped session
+    // must not keep accruing while its own requests are blocked.
+    if trip_mode == crate::policy::TripwireMode::Block
+        && engine.watch.lock().await.tripped().is_some()
+    {
         return;
     }
     let mut ctx = RequestCtx {
@@ -1352,11 +1649,13 @@ async fn keepalive_fire(
     let usage = provider.and_then(|p| crate::pricing::parse_usage_json(p, &bytes));
     let token_record = match (usage, rate) {
         (Some(u), Some(rate)) => {
-            let cost = match billing {
-                crate::pricing::Billing::Subscription => 0.0,
-                crate::pricing::Billing::Usage => u.cost_usd(&rate),
-            };
-            Some((crate::pricing::model_key(Some(model), billing), u, cost))
+            let (cost, ref_cost) = crate::pricing::split_cost(billing, &u, &rate);
+            Some((
+                crate::pricing::model_key(Some(model), billing),
+                u,
+                cost,
+                ref_cost,
+            ))
         }
         _ => None,
     };
@@ -1366,13 +1665,15 @@ async fn keepalive_fire(
         let mut meter = engine.meter.lock().await;
         meter.record_traffic(&now, host, bytes_up, bytes_down);
         match &token_record {
-            Some((key, u, cost)) => meter.record_tokens(&now, host, key, u, *cost),
+            Some((key, u, cost, ref_cost)) => {
+                meter.record_tokens(&now, host, key, u, *cost, *ref_cost)
+            }
             None => meter.add_estimated(&now, host, bytes_up + bytes_down),
         }
         let _ = meter.flush(&now);
     }
     let note = match &token_record {
-        Some((key, u, _)) => format!("proxy-initiated pre-warm; {}", usage_note_for(key, u)),
+        Some((key, u, _, _)) => format!("proxy-initiated pre-warm; {}", usage_note_for(key, u)),
         None => "proxy-initiated pre-warm".to_string(),
     };
     audit(
@@ -1393,7 +1694,8 @@ async fn keepalive_fire(
             dur_ms: Some(started.elapsed().as_millis() as u64),
             bytes_up,
             bytes_down,
-            usage: token_record.map(|(key, u, cost)| usage_rec_for(&key, &u, cost)),
+            usage: token_record
+                .map(|(key, u, cost, ref_cost)| usage_rec_for(&key, &u, cost, ref_cost)),
             ..Default::default()
         },
     )
@@ -1419,6 +1721,74 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // env_guard's std MutexGuard is held across awaits on purpose: it
+    // serializes the process-global DECOYRAIL_HOME for the whole test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn keepalive_fire_respects_a_standing_spend_trip() {
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+        crate::policy_edit::write_policy(
+            "default_action = \"deny\"\n\
+             [[rule]]\nname = \"local\"\nhosts = [\"localhost\"]\naction = \"allow\"\n",
+            "test",
+        )
+        .unwrap();
+
+        let engine = Engine::boot().unwrap();
+        let trip = crate::watch::Signal::Repeat {
+            fingerprint: "aabbccdd11223344".into(),
+            count: 3,
+        }
+        .to_trip(300, crate::util::now_rfc3339(), "sid".into());
+        engine.watch.lock().await.set_tripped(Some(trip));
+
+        // Port 1 is unreachable on purpose: the trip check must return
+        // before anything is sent, so nothing here needs a network.
+        let tmpl = crate::cache::KeepAliveTemplate {
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            port: 1,
+            headers: Vec::new(),
+            body: br#"{"model":"m","messages":[]}"#.to_vec(),
+        };
+        keepalive_fire(&engine, "localhost", "m", &tmpl).await;
+        let log = std::fs::read_to_string(crate::config::audit_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"keepalive\""),
+            "a tripped session must not pre-warm: {log}"
+        );
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn keepalive_fire_respects_a_denying_policy() {
+        let _g = crate::util::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", tmp.path());
+        crate::policy_edit::write_policy("default_action = \"deny\"\n", "test").unwrap();
+
+        let engine = Engine::boot().unwrap();
+        // Port 1 is unreachable on purpose: the deny must return before
+        // anything is sent, so nothing here needs a network.
+        let tmpl = crate::cache::KeepAliveTemplate {
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            port: 1,
+            headers: Vec::new(),
+            body: br#"{"model":"m","messages":[]}"#.to_vec(),
+        };
+        keepalive_fire(&engine, "api.example.com", "m", &tmpl).await;
+        let log = std::fs::read_to_string(crate::config::audit_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"keepalive\""),
+            "a denied destination must not pre-warm: {log}"
+        );
+        std::env::remove_var("DECOYRAIL_HOME");
+    }
 
     #[test]
     fn parse_head_normalizes_connect_target() {

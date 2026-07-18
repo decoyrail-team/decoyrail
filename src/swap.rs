@@ -337,6 +337,7 @@ mod tests {
             rule: "test".into(),
             escalated: false,
             allow_secrets: allow_secrets.iter().map(|s| s.to_string()).collect(),
+            route: Default::default(),
         }
     }
 

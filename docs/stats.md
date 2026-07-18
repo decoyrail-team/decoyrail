@@ -21,19 +21,25 @@ A typical report:
 ```
 Window: today (2026-07-10T04 to 2026-07-11T04 UTC)
 Requests: 41 (39 allowed, 0 warned, 2 denied: 1 policy, 1 tripwire, 0 dlp, 0 budget)
-Security: 1 tripwire hits, 0 DLP alerts
+Security: 1 tripwire hits, 0 DLP alerts, 0 policy tampers
 Tokens: in 48.2k  out 12.9k  cache read 1.1M  cache write 22.0k  cached 96%
 Spend: $1.8420
+Plan-absorbed: ~$3.1080 API-equivalent (subscription traffic, not billed)
 Bytes: up 1.2 MB  down 6.4 MB
 Latency: avg 830ms  p95 ~2.0s  max 9.4s  (39 measured)
 
 By model:
-  claude-sonnet-5     37 req  in     1.1M  out    12.9k  $1.8420  cached 96%
-  (no usage data)      4 req  in        0  out        0  $0.0000  [2 alerts]
+  claude-sonnet-5                    21 req  in   612.4k  out     7.1k  $1.8420  cached 96%
+  claude-sonnet-5 [subscription]     16 req  in   501.2k  out     5.8k  $0.0000  plan-absorbed ~$3.1080  cached 95%
+  (no usage data)                     4 req  in        0  out        0  $0.0000  [2 alerts]
 ```
 
 Zeros are printed on purpose. A window with no tripwires saying "0 tripwire
-hits" is itself a report; silence would be ambiguous.
+hits" is itself a report; silence would be ambiguous. The plan-absorbed
+line appears only when subscription traffic exists in the window: it is the
+API-equivalent reference cost of plan-covered requests (see
+[metering](audit-and-metering.md)), reported next to spend and never summed
+into it.
 
 ## Windows and breakdowns
 
@@ -104,7 +110,7 @@ total tokens, dollars, and alert count, in that order.
 ```
 
 The alert count is denies plus tripwire hits plus DLP alerts plus warn
-events, each counted once. If the audit chain fails verification the line is prefixed
+events plus policy tampers, each counted once. If the audit chain fails verification the line is prefixed
 with `[audit integrity FAILED] `. This format is a compatibility promise:
 poll it from a menu bar app or a statusline every few seconds and nothing
 about it will change shape within a major version. For anything richer, use
@@ -141,9 +147,12 @@ rows alike, has the same shape:
 | `denies` | `{total, policy, tripwire, dlp, budget}`, denies by reason |
 | `tripwires` | tripwire hits: request-side denies plus response echoes |
 | `dlp_alerts` | DLP warn or mask hits (blocking hits are in `denies.dlp`) |
+| `policy_tamper` | policy loads rejected as tampered (out-of-band edit, missing record) |
+| `policy_changes` | policy writes and blessings made through Decoyrail surfaces |
 | `tokens` | `{input, output, cache_read, cache_write, total}` |
 | `cache_hit_ratio` | `cache_read / (input + cache_read)`, null with no context tokens |
 | `cost_usd` | sum of per-request metered cost (subscription traffic is $0) |
+| `plan_absorbed_usd` | API-equivalent reference cost of subscription traffic: what the plan absorbed at API rates, cache multipliers included. Never part of `cost_usd` (added in a v1-compatible way; absent means an older binary) |
 | `no_usage_requests` | allowed requests whose response carried no usage |
 | `bytes` | `{up, down}` as seen at the proxy |
 | `duration_ms` | `{avg, p95, max, measured}`, null when nothing was measured |
@@ -153,3 +162,15 @@ Breakdown rows are sorted by cost (then requests, then name), except
 plan-covered traffic shows as `<model> [subscription]` and never blends into
 a pay-per-token row; requests without usage data group under
 `(no usage data)`.
+
+## The waste report: `decoyrail stats --waste`
+
+Where `stats` says what was spent, `--waste` says what was spent for nothing, broken down by cause and priced in dollars:
+
+- **Retried identical requests**: the same request (same destination, method, and body, matched by the [spend tripwire's](audit-and-metering.md#the-spend-tripwire) salted fingerprint) re-sent within the tripwire's window. Every re-send after the first is waste, priced at what its response actually metered.
+- **Runaway loops**: the same, past the tripwire's repeat threshold. Repeats the tripwire blocked are counted alongside (they cost nothing; the report shows the loop's true length).
+- **Prompt-cache waste**: repeating context that re-billed at the full input rate for want of a cache marker, priced by the [cache doctor](audit-and-metering.md#the-prompt-cache-report) for the current billing period; `decoyrail cache` has the per-model breakdown.
+
+The numbers are deliberately conservative. Only identifiable waste is counted: byte-identical repeats, never "similar" requests. Billable dollars and plan-absorbed API-equivalent dollars stay separate, exactly as the meter keeps them. A repeat whose response carried no parseable usage is counted and flagged unpriced, never guessed at. And requests written before fingerprints existed can't be grouped, so the report says so instead of reporting zero.
+
+The thresholds are the policy's `[spend_tripwire]` settings, so the report and the enforcement agree on what counts as a loop. `--waste` composes with the window flags and with `--json` (its own schema, versioned separately from the stats report). Everything is read from local state; the report never needs the network.

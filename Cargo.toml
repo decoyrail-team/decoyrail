@@ -1,6 +1,6 @@
 [package]
 name = "decoyrail"
-version = "0.2.11"
+version = "0.3.0"
 edition = "2021"
 description = "Endpoint firewall for AI agents: decoy secrets, egress policy, audit"
 repository = "https://github.com/decoyrail-team/decoyrail"
@@ -24,6 +24,9 @@ chacha20poly1305 = "0.10"
 ring = "0.17"
 rand = "0.8"
 sha2 = "0.10"
+# Policy integrity record (plan 018): HMAC-SHA256 over policy.toml, keyed
+# from the vault key.
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

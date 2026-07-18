@@ -11,6 +11,7 @@ pub mod config;
 pub mod detect;
 pub mod engine;
 pub mod guard;
+pub mod integrity;
 pub mod keyring;
 pub mod license;
 pub mod meter;
@@ -18,10 +19,13 @@ pub mod policy;
 pub mod policy_edit;
 pub mod pricing;
 pub mod proxy;
+pub mod softland;
 pub mod stats;
 pub mod swap;
 pub mod util;
 pub mod vault;
+pub mod waste;
+pub mod watch;
 
 /// Install the process-wide rustls crypto provider. Exposed for integration
 /// tests, which need it before standing up any TLS server or client.

@@ -202,11 +202,13 @@ async fn proxy_end_to_end() {
     // Policy: allow localhost and release the two swappable secrets there
     // (one vault entry by name, one session entry by name), default deny.
     // The honey secret is listed nowhere: seen toward localhost it tripwires.
-    std::fs::write(
-        home.path().join("policy.toml"),
+    // Written through Decoyrail's own recorded write path: plan 018 makes the
+    // engine load only a policy that verifies against its integrity record.
+    decoyrail::policy_edit::write_policy(
         "default_action = \"deny\"\nescalate_fallback = \"deny\"\n\
          [[rule]]\nname = \"local\"\nhosts = [\"localhost\"]\naction = \"allow\"\n\
          allow_secrets = [\"svc\", \"env:LOCAL_TOKEN\"]\n",
+        "test setup",
     )
     .unwrap();
 
@@ -468,6 +470,21 @@ async fn proxy_end_to_end() {
     let sub = &disk.per_host["localhost"].models["claude-sonnet-5-20250929 [subscription]"];
     assert_eq!(sub.input_tokens, 1000);
     assert_eq!(sub.cost_usd, 0.0);
+    // Plan 019: the same tokens carry their API-equivalent reference cost,
+    // hand-computed at claude-sonnet-5 rates with cache multipliers
+    // (1000*3 + 200*15 + 5000*0.3 + 100*3.75 per mtok), and the reference
+    // dollars never reach billable spend or the budget switch.
+    assert!(
+        (sub.ref_cost_usd - 0.007875).abs() < 1e-9,
+        "reference cost was {}",
+        sub.ref_cost_usd
+    );
+    assert!((disk.plan_absorbed() - 0.007875).abs() < 1e-9);
+    let billable_before_sub_excludes_ref = disk.total_cost();
+    assert!(
+        (billable_before_sub_excludes_ref - 0.007875).abs() < 1e-9,
+        "scenario 10's billed request is the only spend so far; total was {billable_before_sub_excludes_ref}"
+    );
 
     // 12. EXACT METERING (SSE): usage events are scanned out of the stream as
     //     it passes; the meter is updated asynchronously after the stream
@@ -597,7 +614,8 @@ async fn proxy_end_to_end() {
     // lands within the filesystem's timestamp granularity.
     let set_dlp = |dlp: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, format!("{policy_rules}[dlp]\n{dlp}\n")).unwrap();
+        decoyrail::policy_edit::write_policy(&format!("{policy_rules}[dlp]\n{dlp}\n"), "test")
+            .unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -704,12 +722,12 @@ async fn proxy_end_to_end() {
     //     value).
     {
         let path = home.path().join("policy.toml");
-        std::fs::write(
-            &path,
-            format!(
+        decoyrail::policy_edit::write_policy(
+            &format!(
                 "{policy_rules}allow_secrets = [\"env:LOCAL_TOKEN\"]\n\
                  [dlp]\npan = \"block\"\ndebug = true\n"
             ),
+            "test",
         )
         .unwrap();
         let f = std::fs::OpenOptions::new()
@@ -823,6 +841,15 @@ async fn proxy_end_to_end() {
             .expect("subscription model row");
         assert_eq!(sub.stats.requests, 1);
         assert_eq!(sub.stats.cost_usd, 0.0);
+        // The subscription bucket carries the reference figure; the billed
+        // bucket carries none. Separate buckets, nothing shared (plan 019).
+        assert!(
+            (sub.stats.plan_absorbed_usd - 0.007875).abs() < 1e-9,
+            "plan absorbed was {}",
+            sub.stats.plan_absorbed_usd
+        );
+        assert_eq!(billed.stats.plan_absorbed_usd, 0.0);
+        assert!((t.plan_absorbed_usd - 0.007875).abs() < 1e-9);
 
         // Session attribution: one labeled session owns all the traffic.
         assert_eq!(report.by_session.len(), 1);
@@ -861,7 +888,8 @@ async fn proxy_end_to_end() {
     //     here through the same hot-reload path as `set_dlp`.
     let set_cache = |cache: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, format!("{policy_rules}[cache]\n{cache}\n")).unwrap();
+        decoyrail::policy_edit::write_policy(&format!("{policy_rules}[cache]\n{cache}\n"), "test")
+            .unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -1051,7 +1079,7 @@ async fn proxy_end_to_end() {
     //     no secret is ever released by warn.
     let set_policy = |text: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, text).unwrap();
+        decoyrail::policy_edit::write_policy(text, "test").unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)

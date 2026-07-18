@@ -14,6 +14,7 @@ exfiltration attempt: blocked and recorded.
 | [Sensitive-data filtering](dlp.md) | block, mask, or warn on structured sensitive data |
 | [Audit & metering](audit-and-metering.md) | inspect events, verify logs, and control spend |
 | [Analytics](stats.md) | query spend, usage, and security events |
+| [Licensing](license.md) | install a license and understand tiers, expiry, and grace |
 | [Threat model](threat-model.md) | understand Decoyrail's guarantees and limits |
 
 What's coming next is in the [roadmap](../ROADMAP.md).

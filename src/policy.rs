@@ -23,6 +23,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config;
 use crate::vault::{glob_match, Secret, PROVIDER_LABELS};
@@ -36,6 +37,12 @@ pub enum Action {
     /// secret. The middle posture between "deny what I haven't listed" and
     /// running unprotected; see plans/017.
     Warn,
+    /// Allow, plus rewrite the requested model per the rule's explicit
+    /// `route` map (plan 006, Pro). Policy-wise identical to allow — secret
+    /// release still rides `allow_secrets`, and deny/tripwire/DLP/budget
+    /// outrank it the same way — so no license state ever changes
+    /// reachability, only whether the rewrite happens.
+    Route,
     /// Defer to judge/human. Resolves to `escalate_fallback` until v0.5.
     Escalate,
 }
@@ -47,6 +54,7 @@ impl Action {
             Action::Allow => "allow",
             Action::Deny => "deny",
             Action::Warn => "warn",
+            Action::Route => "route",
             Action::Escalate => "escalate",
         }
     }
@@ -57,9 +65,10 @@ impl Action {
             "allow" => Ok(Action::Allow),
             "deny" => Ok(Action::Deny),
             "warn" => Ok(Action::Warn),
+            "route" => Ok(Action::Route),
             "escalate" => Ok(Action::Escalate),
             other => Err(anyhow::anyhow!(
-                "unknown action '{other}' (use allow|deny|warn|escalate)"
+                "unknown action '{other}' (use allow|deny|warn|route|escalate)"
             )),
         }
     }
@@ -79,9 +88,17 @@ pub struct Rule {
     pub action: Action,
     /// Secrets expected at destinations this rule matches: vault entry names,
     /// or provider labels as `provider:<label>`. Released (decoy swapped for
-    /// the real value) only when the rule resolves to allow.
+    /// the real value) only when the rule resolves to allow (or route, which
+    /// is allow plus a model rewrite).
     #[serde(default)]
     pub allow_secrets: Vec<String>,
+    /// Model map for `action = "route"` (plan 006): requested model to the
+    /// model that forwards. Explicit configuration, like the soft-landing
+    /// map — Decoyrail has no built-in opinions, and a request whose model
+    /// is absent, unmapped, or unidentifiable forwards unmodified. Ignored
+    /// on every other action.
+    #[serde(default)]
+    pub route: BTreeMap<String, String>,
 }
 
 /// Does an `allow_secrets` list cover this secret (by name or provider label)?
@@ -213,6 +230,78 @@ impl Default for CacheConfig {
     }
 }
 
+/// Budget soft-landing (plan 003): the band between a configurable share of
+/// the monthly budget and the hard limit. Inside it, requests naming a model
+/// on the left of `map` are rewritten to the cheaper model on the right; at
+/// 100% the kill switch still stops everything, unchanged. Off by default
+/// (no threshold, no map), Pro-gated at its entry point in the pipeline, and
+/// hot-reloaded like the rest of the policy. Mirrors `[soft_landing]` in the
+/// policy file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoftLandingConfig {
+    /// Percent of the monthly budget where downgrades begin. 0 disables.
+    pub threshold_pct: f64,
+    /// Explicit downgrade map, requested model to cheaper model. The map is
+    /// the customer's opinion of "equivalent"; Decoyrail has none built in,
+    /// and a model with no entry forwards untouched.
+    pub map: BTreeMap<String, String>,
+}
+
+impl SoftLandingConfig {
+    /// Configured on: a positive threshold and at least one mapping.
+    pub fn enabled(&self) -> bool {
+        self.threshold_pct > 0.0 && !self.map.is_empty()
+    }
+}
+
+/// What a spend-tripwire trip does to subsequent LLM traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TripwireMode {
+    /// Deny LLM-bound requests until `decoyrail trip clear` (the default).
+    Block,
+    /// Record the trip and keep forwarding: visibility before enforcement.
+    Alert,
+    /// No detection at all.
+    Off,
+}
+
+/// Spend tripwire (plan 002): mechanical runaway detection — the same
+/// request repeated many times in a window, or a spend rate far above the
+/// session's own baseline. On by default with conservative thresholds; a
+/// safety feature, so it ships in the free tier and no license gates it.
+/// Mirrors `[spend_tripwire]` in the policy file, hot-reloaded like the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpendTripwireConfig {
+    pub mode: TripwireMode,
+    /// Identical requests inside the window that trip. 0 disables repeat
+    /// detection. The default is generous to polling patterns: fifteen
+    /// byte-identical LLM calls in five minutes is a loop, not a retry.
+    pub repeats: u32,
+    /// Sliding window, seconds, shared by both detectors.
+    pub window_secs: u64,
+    /// A window's spend rate must exceed the session baseline by this factor
+    /// to trip. 0 disables rate detection.
+    pub rate_multiplier: f64,
+    /// And exceed this many dollars inside the window, so a spiky-but-cheap
+    /// burst over a near-zero baseline never trips.
+    pub rate_floor_usd: f64,
+}
+
+impl Default for SpendTripwireConfig {
+    fn default() -> Self {
+        Self {
+            mode: TripwireMode::Block,
+            repeats: 15,
+            window_secs: 300,
+            rate_multiplier: 10.0,
+            rate_floor_usd: 5.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub default_action: Action,
@@ -224,6 +313,10 @@ pub struct Policy {
     pub dlp: DlpConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub soft_landing: SoftLandingConfig,
+    #[serde(default)]
+    pub spend_tripwire: SpendTripwireConfig,
 }
 
 fn default_escalate_fallback() -> Action {
@@ -239,14 +332,18 @@ pub struct Decision {
     /// The winning rule's `allow_secrets`. Whether a listed secret is swapped
     /// or merely spared the tripwire depends on `action`.
     pub allow_secrets: Vec<String>,
+    /// The winning rule's model map (route rules only; empty otherwise).
+    pub route: BTreeMap<String, String>,
 }
 
 impl Decision {
     /// The winning rule releases this secret: swap decoy for real (transport
-    /// and location checks still apply). Only allow releases — a warn rule
-    /// forwards, but its listed secrets stay decoys.
+    /// and location checks still apply). Only allow — and route, which is
+    /// allow plus a model rewrite — releases; a warn rule forwards, but its
+    /// listed secrets stay decoys.
     pub fn releases(&self, secret: &Secret) -> bool {
-        self.action == Action::Allow && lists_secret(&self.allow_secrets, secret)
+        matches!(self.action, Action::Allow | Action::Route)
+            && lists_secret(&self.allow_secrets, secret)
     }
 
     /// The winning rule expects this secret here even though it is not
@@ -257,33 +354,118 @@ impl Decision {
     }
 }
 
-impl Policy {
-    pub fn load_or_default() -> Result<Self> {
-        config::ensure_home()?;
-        let path = config::policy_path()?;
-        if !path.exists() {
-            std::fs::write(&path, DEFAULT_POLICY_TOML)?;
+/// Why a trusted policy load was refused. The two arms tell different
+/// stories downstream: `Untrusted` is a tamper event (alarm prominence),
+/// `Other` is the ordinary broken-file path (parse failure, unreadable
+/// state). Both fail closed.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The file was changed outside Decoyrail, has no integrity record, or
+    /// is missing while its record exists. Carries the full instructive
+    /// message for humans.
+    Untrusted(String),
+    Other(anyhow::Error),
+}
+
+impl LoadError {
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            LoadError::Untrusted(msg) => anyhow::anyhow!(msg),
+            LoadError::Other(e) => e,
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+    }
+}
+
+/// Read the policy text, materializing the shipped default (through the
+/// recorded write path, so it is born trusted) on a genuinely fresh home. A
+/// missing file whose integrity record exists is not fresh: a deleted
+/// policy is an edit, and re-materializing over it would silently re-bless.
+fn read_or_materialize() -> Result<String, LoadError> {
+    let inner = || -> Result<std::path::PathBuf> {
+        config::ensure_home()?;
+        config::policy_path()
+    };
+    let path = inner().map_err(LoadError::Other)?;
+    if !path.exists() {
+        let sig_exists = config::policy_sig_path()
+            .map(|p| p.exists())
+            .map_err(LoadError::Other)?;
+        if sig_exists {
+            return Err(LoadError::Untrusted(format!(
+                "{} is missing but its integrity record exists; a deleted policy is an \
+                 edit. Restore the file (last backup: {}), or start over with \
+                 `decoyrail policy reset`.",
+                path.display(),
+                config::policy_backup_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "policy.toml.bak".into()),
+            )));
+        }
+        crate::integrity::install(DEFAULT_POLICY_TOML, "default policy")
+            .map_err(LoadError::Other)?;
+    }
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))
+        .map_err(LoadError::Other)
+}
+
+impl Policy {
+    /// Parse-only load for CLI read paths (`policy ls`, `policy test`,
+    /// `vault ls`): these report on the file, including an untrusted one,
+    /// and never release a secret. The proxy loads via [`Self::load_trusted`].
+    pub fn load_or_default() -> Result<Self> {
+        let text = read_or_materialize().map_err(LoadError::into_anyhow)?;
         let policy: Policy = toml::from_str(&text).context("parsing policy.toml")?;
         Ok(policy)
+    }
+
+    /// The proxy's load: only a policy Decoyrail wrote or blessed for this
+    /// home. Verification is silent and applies in every home; anything
+    /// unverifiable is [`LoadError::Untrusted`], which callers surface with
+    /// alarm prominence and fail closed on.
+    pub fn load_trusted() -> Result<Self, LoadError> {
+        let text = read_or_materialize()?;
+        match crate::integrity::verify(&text) {
+            Ok(crate::integrity::Verdict::Trusted) => toml::from_str(&text)
+                .context("parsing policy.toml")
+                .map_err(LoadError::Other),
+            Ok(v) => Err(LoadError::Untrusted(crate::integrity::untrusted_message(v))),
+            Err(e) => Err(LoadError::Other(e)),
+        }
     }
 
     pub fn evaluate(&self, host: &str, path: &str, method: &str) -> Decision {
         for rule in &self.rules {
             if rule.matches(host, path, method) {
-                return self.resolve(rule.action, rule.name.clone(), rule.allow_secrets.clone());
+                return self.resolve(
+                    rule.action,
+                    rule.name.clone(),
+                    rule.allow_secrets.clone(),
+                    rule.route.clone(),
+                );
             }
         }
-        self.resolve(self.default_action, "default".into(), Vec::new())
+        self.resolve(
+            self.default_action,
+            "default".into(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
     }
 
-    fn resolve(&self, action: Action, rule: String, allow_secrets: Vec<String>) -> Decision {
+    fn resolve(
+        &self,
+        action: Action,
+        rule: String,
+        allow_secrets: Vec<String>,
+        route: BTreeMap<String, String>,
+    ) -> Decision {
         match action {
             Action::Escalate => Decision {
                 // A hand-edited fallback of "escalate" would otherwise resolve
-                // to an action the pipeline forwards; fail closed instead.
+                // to an action the pipeline forwards; fail closed instead. A
+                // fallback of "route" resolves like allow — the escalated
+                // rule has no map, so nothing ever rewrites through it.
                 action: match self.escalate_fallback {
                     Action::Escalate => Action::Deny,
                     other => other,
@@ -291,22 +473,27 @@ impl Policy {
                 rule,
                 escalated: true,
                 allow_secrets,
+                route,
             },
             other => Decision {
                 action: other,
                 rule,
                 escalated: false,
                 allow_secrets,
+                route,
             },
         }
     }
 
-    /// Rules that can release this secret (allow rules listing it), for
-    /// `vault ls` and the `decoyrail run` startup report.
+    /// Rules that can release this secret (allow and route rules listing
+    /// it), for `vault ls` and the `decoyrail run` startup report.
     pub fn releasing_rules(&self, secret: &Secret) -> Vec<&Rule> {
         self.rules
             .iter()
-            .filter(|r| r.action == Action::Allow && lists_secret(&r.allow_secrets, secret))
+            .filter(|r| {
+                matches!(r.action, Action::Allow | Action::Route)
+                    && lists_secret(&r.allow_secrets, secret)
+            })
             .collect()
     }
 
@@ -358,6 +545,35 @@ impl Policy {
         }
         warnings
     }
+
+    /// Non-blocking sanity warnings about route rules (plan 006): a route
+    /// rule whose map is empty never rewrites (it is just an allow; say so),
+    /// and a map targeting a model the pricing table doesn't price is likely
+    /// a typo the provider will reject — the same flag 003 raises on a
+    /// soft-landing target. Split from [`Self::lint`] because only these
+    /// warnings need the pricing table.
+    pub fn lint_routes(&self, pricing: &crate::pricing::Pricing) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for rule in self.rules.iter().filter(|r| r.action == Action::Route) {
+            if rule.route.is_empty() {
+                warnings.push(format!(
+                    "rule '{}': action is route but the route map is empty, so it \
+                     behaves exactly like allow and never rewrites",
+                    rule.name
+                ));
+            }
+            for to in rule.route.values() {
+                if !pricing.knows_model(to) {
+                    warnings.push(format!(
+                        "rule '{}': route target model '{to}' is not in the pricing \
+                         table (typo? requests forward as configured either way)",
+                        rule.name
+                    ));
+                }
+            }
+        }
+        warnings
+    }
 }
 
 /// Does the `outer` host glob match every host the `inner` glob matches?
@@ -386,10 +602,11 @@ pub const DEFAULT_POLICY_TOML: &str = r#"# Decoyrail default policy: "Claude Cod
 # On an allow rule the decoy is swapped for the real value; on a deny or
 # escalate rule the request blocks without raising the honeytoken alarm.
 #
-# Actions: allow | deny | warn | escalate. "warn" forwards like allow but
-# records a distinct warn event and never releases a secret; set it as the
+# Actions: allow | deny | warn | route | escalate. "warn" forwards like allow
+# but records a distinct warn event and never releases a secret; set it as the
 # default (or run `decoyrail run --watch`) to tune the policy against real
-# traffic without blocking the agent first.
+# traffic without blocking the agent first. "route" is allow plus a model
+# rewrite per the rule's explicit map (Pro; see the example near the end).
 default_action = "deny"
 escalate_fallback = "deny"
 
@@ -509,6 +726,41 @@ email = "off"    # email addresses; off because commits and packages carry them
 # keep_alive_max = 6        # cap pre-warms per prefix per session
 # serialize_fanout = true   # let one of N parallel requests write the cache, the rest read it
 # fanout_timeout_ms = 2000  # sibling wait cap so a stalled leader can't wedge them
+
+# Model router (Pro). A rule with action = "route" allows exactly like
+# "allow" (secrets still release via allow_secrets) and rewrites the requested
+# model per its explicit map; deny/tripwire/DLP/budget outrank it as they
+# outrank an allow. Every rewrite is audited (action: route) and marked on the
+# response (x-decoyrail-route); a model with no map entry forwards untouched.
+# [[rule]]
+# name = "anthropic-cheap-tier"
+# hosts = ["api.anthropic.com"]
+# action = "route"
+# allow_secrets = ["provider:anthropic"]
+# route = { "claude-opus-4" = "claude-sonnet-5" }
+
+# Budget soft-landing (Pro). Past threshold_pct of the monthly budget (set via
+# `decoyrail budget`), requests naming a model on the left are rewritten to
+# the cheaper model on the right; at 100% the kill switch still stops
+# everything. Every downgrade is audited, marked on the response
+# (x-decoyrail-downgrade), and invalidates the provider prompt cache (caches
+# are model-scoped). Off by default.
+# [soft_landing]
+# threshold_pct = 80
+# map = { "claude-opus-4" = "claude-sonnet-5" }
+
+# Spend tripwire (free). Catches runaway loops in minutes: the same request
+# repeated `repeats` times inside the window, or a spend rate far above the
+# session's own baseline, blocks LLM-bound traffic (non-LLM egress keeps
+# flowing) until `decoyrail trip clear`. On by default with the settings
+# below; uncomment to tune, or set mode = "alert" (record, don't block) or
+# "off".
+# [spend_tripwire]
+# mode = "block"
+# repeats = 15
+# window_secs = 300
+# rate_multiplier = 10.0
+# rate_floor_usd = 5.0
 "#;
 
 #[cfg(test)]
@@ -843,6 +1095,144 @@ debug = true
         assert!(!p.cache.repair);
         assert!(!p.cache.keep_alive);
         assert!(!p.cache.serialize_fanout);
+        assert!(!p.soft_landing.enabled());
+    }
+
+    #[test]
+    fn soft_landing_defaults_off_and_parses_overrides() {
+        // Absent section (including every policy written before it existed):
+        // off, nothing rewrites.
+        let p: Policy = toml::from_str("default_action = \"deny\"").unwrap();
+        assert!(!p.soft_landing.enabled());
+        assert_eq!(p.soft_landing.threshold_pct, 0.0);
+        assert!(p.soft_landing.map.is_empty());
+
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[soft_landing]\nthreshold_pct = 80\n\
+             map = { \"claude-opus-4\" = \"claude-sonnet-5\", \"gpt-5\" = \"gpt-5-mini\" }\n",
+        )
+        .unwrap();
+        assert!(p.soft_landing.enabled());
+        assert_eq!(p.soft_landing.threshold_pct, 80.0);
+        assert_eq!(p.soft_landing.map["claude-opus-4"], "claude-sonnet-5");
+        assert_eq!(p.soft_landing.map["gpt-5"], "gpt-5-mini");
+
+        // A threshold without a map (or a map without a threshold) stays off:
+        // both halves are explicit opt-ins.
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[soft_landing]\nthreshold_pct = 80\n")
+                .unwrap();
+        assert!(!p.soft_landing.enabled());
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[soft_landing]\nmap = { \"a\" = \"b\" }\n")
+                .unwrap();
+        assert!(!p.soft_landing.enabled());
+    }
+
+    #[test]
+    fn spend_tripwire_defaults_on_and_parses_overrides() {
+        // Absent section (including every policy written before it existed):
+        // the conservative defaults, in block mode. A safety feature defaults
+        // on, unlike the paid conveniences above.
+        let p: Policy = toml::from_str("default_action = \"deny\"").unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Block);
+        assert_eq!(p.spend_tripwire.repeats, 15);
+        assert_eq!(p.spend_tripwire.window_secs, 300);
+        assert_eq!(p.spend_tripwire.rate_multiplier, 10.0);
+        assert_eq!(p.spend_tripwire.rate_floor_usd, 5.0);
+
+        // A partial table overrides just what it names.
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[spend_tripwire]\nmode = \"alert\"\nrepeats = 30\n",
+        )
+        .unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Alert);
+        assert_eq!(p.spend_tripwire.repeats, 30);
+        assert_eq!(
+            p.spend_tripwire.window_secs, 300,
+            "unnamed fields keep defaults"
+        );
+
+        let p: Policy =
+            toml::from_str("default_action = \"deny\"\n[spend_tripwire]\nmode = \"off\"\n")
+                .unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Off);
+
+        // The shipped default policy parses with the commented table intact.
+        let p: Policy = toml::from_str(DEFAULT_POLICY_TOML).unwrap();
+        assert_eq!(p.spend_tripwire.mode, TripwireMode::Block);
+    }
+
+    #[test]
+    fn load_trusted_only_loads_what_decoyrail_wrote() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        // Fresh home: the materialized default is born trusted.
+        assert!(Policy::load_trusted().is_ok());
+
+        // One appended byte: untrusted, with the cure named.
+        let path = crate::config::policy_path().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}#")).unwrap();
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Untrusted(_)), "{err:?}");
+        let msg = err.into_anyhow().to_string();
+        assert!(msg.contains("policy sign"), "{msg}");
+        // CLI read paths still parse the untrusted file (they report on it,
+        // and `policy ls` says it is untrusted; they release nothing).
+        assert!(Policy::load_or_default().is_ok());
+
+        // Byte-identical restore: trusted again, no blessing needed.
+        std::fs::write(&path, &text).unwrap();
+        assert!(Policy::load_trusted().is_ok());
+
+        // Record deleted, file untouched: absence of proof is absence of
+        // trust, never a cue to re-bless silently.
+        std::fs::remove_file(crate::config::policy_sig_path().unwrap()).unwrap();
+        assert!(matches!(
+            Policy::load_trusted(),
+            Err(LoadError::Untrusted(_))
+        ));
+    }
+
+    #[test]
+    fn deleted_policy_with_record_is_an_edit() {
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        assert!(Policy::load_trusted().is_ok());
+        std::fs::remove_file(crate::config::policy_path().unwrap()).unwrap();
+
+        // Neither load may re-materialize a default over the evidence.
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Untrusted(_)), "{err:?}");
+        assert!(err.into_anyhow().to_string().contains("policy reset"));
+        assert!(Policy::load_or_default().is_err());
+        assert!(!crate::config::policy_path().unwrap().exists());
+    }
+
+    /// An unreadable record is the ordinary broken-file error (`Other`), not
+    /// the tamper story: nothing claims an edit happened, the load just
+    /// cannot prove anything either way and fails closed with the cause.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_record_is_other_not_tamper() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::util::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DECOYRAIL_HOME", dir.path());
+
+        assert!(Policy::load_trusted().is_ok());
+        let sig = crate::config::policy_sig_path().unwrap();
+        std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = Policy::load_trusted().unwrap_err();
+        assert!(matches!(err, LoadError::Other(_)), "{err:?}");
+        assert!(err.into_anyhow().to_string().contains("reading"));
+        std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Policy::load_trusted().is_ok());
     }
 
     #[test]
@@ -913,6 +1303,121 @@ allow_secrets = ["svc"]
         assert!(!d.releases(&secret("svc", None)), "warn must never swap");
         assert!(d.expects(&secret("svc", None)), "but no honeytoken alarm");
         assert!(!d.expects(&secret("other", None)));
+    }
+
+    #[test]
+    fn route_parses_carries_map_and_releases_like_allow() {
+        assert_eq!(Action::parse("route").unwrap(), Action::Route);
+        assert_eq!(Action::parse("ROUTE").unwrap(), Action::Route);
+        assert_eq!(Action::Route.as_str(), "route");
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "routed"
+hosts = ["api.example.com"]
+action = "route"
+allow_secrets = ["svc"]
+route = { "claude-opus-4" = "claude-sonnet-5" }
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/v1/x", "POST");
+        assert_eq!(d.action, Action::Route);
+        assert_eq!(d.rule, "routed");
+        // The winning rule's map rides the decision for the pipeline.
+        assert_eq!(d.route["claude-opus-4"], "claude-sonnet-5");
+        // Policy-wise a route rule is an allow: it releases and expects its
+        // listed secrets exactly the same way.
+        assert!(d.releases(&secret("svc", None)));
+        assert!(d.expects(&secret("svc", None)));
+        assert!(!d.releases(&secret("other", None)));
+        assert_eq!(p.releasing_rules(&secret("svc", None)).len(), 1);
+        // A non-route decision carries no map.
+        let d = p.evaluate("evil.example.com", "/", "POST");
+        assert!(d.route.is_empty());
+    }
+
+    #[test]
+    fn deny_above_route_wins_and_route_map_defaults_empty() {
+        // First-match-wins gives deny/escalate precedence over a route rule
+        // with no new machinery, exactly as over an allow.
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "blocked"
+hosts = ["api.example.com"]
+path_prefixes = ["/blocked"]
+action = "deny"
+[[rule]]
+name = "routed"
+hosts = ["api.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonnet-5" }
+"#,
+        )
+        .unwrap();
+        let d = p.evaluate("api.example.com", "/blocked/x", "POST");
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.rule, "blocked");
+        assert_eq!(
+            p.evaluate("api.example.com", "/v1/x", "POST").action,
+            Action::Route
+        );
+        // A rule without the key parses with an empty map (every policy
+        // written before plan 006 keeps loading).
+        let p: Policy = toml::from_str(
+            "default_action = \"deny\"\n[[rule]]\nname = \"r\"\n\
+             hosts = [\"x.example.com\"]\naction = \"route\"\n",
+        )
+        .unwrap();
+        assert!(p.rules[0].route.is_empty());
+    }
+
+    #[test]
+    fn lint_routes_flags_empty_maps_and_unpriced_targets() {
+        let pricing = crate::pricing::Pricing::default();
+        let p: Policy = toml::from_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "empty-map"
+hosts = ["a.example.com"]
+action = "route"
+[[rule]]
+name = "typo"
+hosts = ["b.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonet-5" }
+[[rule]]
+name = "fine"
+hosts = ["c.example.com"]
+action = "route"
+route = { "claude-opus-4" = "claude-sonnet-5" }
+[[rule]]
+name = "not-a-route"
+hosts = ["d.example.com"]
+action = "allow"
+"#,
+        )
+        .unwrap();
+        let warnings = p.lint_routes(&pricing);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'empty-map'") && w.contains("empty")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'typo'") && w.contains("claude-sonet-5")),
+            "{warnings:?}"
+        );
+        // The shipped default (no route rules) lints route-clean.
+        assert!(policy().lint_routes(&pricing).is_empty());
     }
 
     #[test]

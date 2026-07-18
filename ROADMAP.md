@@ -23,7 +23,7 @@ Not in the product yet: machine-wide capture, the LLM judge, SigV4
 re-signing, SSRF blocking, rate limiting, and any GUI. The phases below cover
 them.
 
-## v0.3: The boundary pays for itself (in progress)
+## v0.3: The boundary pays for itself (shipped: the v0.3.x releases)
 
 *The bar: Decoyrail can show a team, in dollars, what it saved them last
 month, and the number is bigger than its own bill.*
@@ -56,10 +56,12 @@ automatic fixes are the paid tier.
   request. Where usage can't be parsed, the byte estimate remains and is
   labeled as an estimate. Accurate metering stays in the free core; the
   fleet roll-up in v0.4 is what the team tiers add.
-- **The waste report** (free): the metering above, turned into a verdict. A
-  report of what was identifiably wasted this month and why: retried
-  requests, cache misses on repeated context, runaway loops, priced in
-  dollars per seat, agent, and session.
+- **The waste report** (free, shipped): the metering above, turned into a
+  verdict. `decoyrail stats --waste` reports what was identifiably wasted
+  this month and why: retried identical requests, runaway loops, and cache
+  misses on repeated context, priced in dollars, with billable and
+  plan-absorbed kept apart and unpriceable repeats flagged rather than
+  guessed at.
 - **Reference cost for subscription plans** (free): flat plans are not free
   tokens. The included allowance runs out, heavy sessions hit plan limits,
   and usage past the plan bills at API rates. Subscription traffic keeps
@@ -67,10 +69,11 @@ automatic fixes are the paid tier.
   API-equivalent rates, so you can see what your plan absorbed this month,
   how close you are to outgrowing it, and what your waste costs in the
   currency that matters on a plan: headroom.
-- **Spend tripwire** (free): an agent stuck re-sending the same request, or
-  burning tokens far faster than its own baseline, gets caught in minutes,
-  not at the end of the month. Alert or block, your choice, and the block
-  explains itself so the agent can break its own loop.
+- **Spend tripwire** (free, shipped): an agent stuck re-sending the same
+  request, or burning tokens far faster than its own baseline, gets caught
+  in minutes, not at the end of the month. Alert or block, your choice, and
+  the block explains itself so the agent can break its own loop. Clearing a
+  trip is an explicit command (`decoyrail trip clear`), never a timeout.
 - **Budget soft-landing**: past a threshold you set, traffic downgrades to a
   cheaper model instead of stopping. The kill switch stays for the hard
   limit. Every downgrade is audited and visible; nothing is ever silent.

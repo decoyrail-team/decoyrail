@@ -11,7 +11,7 @@ use std::io::Read;
 
 use decoyrail::stats::{fmt_bytes, fmt_tokens};
 use decoyrail::{
-    audit, ca, cache, config, engine, guard, meter, policy, pricing, proxy, util, vault,
+    audit, ca, cache, config, engine, guard, meter, policy, pricing, proxy, util, vault, watch,
 };
 
 use engine::Engine;
@@ -62,8 +62,34 @@ enum Command {
     Cache,
     /// Set the monthly spend budget (USD; 0 = unlimited).
     Budget { usd: f64 },
+    /// Declare what your subscription plan costs, or show what it absorbed.
+    Plan(PlanArgs),
+    /// Show the spend tripwire state, or clear a trip.
+    Trip {
+        #[command(subcommand)]
+        cmd: Option<TripCmd>,
+    },
     /// Remove Decoyrail's trusted CA, keychain item, and local state.
     Uninstall(UninstallArgs),
+}
+
+#[derive(Subcommand)]
+enum TripCmd {
+    /// Clear the trip: LLM traffic resumes and detection starts fresh.
+    Clear,
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    /// Monthly plan price in USD, e.g. 200.
+    #[arg(long)]
+    price: Option<f64>,
+    /// Plan name shown in reports, e.g. "Claude Max".
+    #[arg(long)]
+    label: Option<String>,
+    /// Remove the declared plan price.
+    #[arg(long, conflicts_with_all = ["price", "label"])]
+    clear: bool,
 }
 
 #[derive(Args)]
@@ -187,6 +213,8 @@ enum PolicyCmd {
     Reset(PolicyConfirmArgs),
     /// Edit the policy with $EDITOR and validate it before saving.
     Edit,
+    /// Bless a hand-edited policy after reviewing what changed (TTY only).
+    Sign,
 }
 
 #[derive(Args)]
@@ -220,7 +248,7 @@ struct PolicyAddArgs {
     /// Restrict to these path prefixes (repeatable; default any).
     #[arg(long = "path-prefix", value_name = "PREFIX")]
     path_prefixes: Vec<String>,
-    /// allow | deny | warn | escalate.
+    /// allow | deny | warn | route | escalate.
     #[arg(long, default_value = "allow")]
     action: String,
     /// Secret to release here: a vault name or provider:<label> (repeatable).
@@ -259,7 +287,7 @@ struct PolicySetArgs {
     /// Clear the path-prefix restriction (match any path).
     #[arg(long)]
     clear_path_prefixes: bool,
-    /// Change the action (allow | deny | warn | escalate).
+    /// Change the action (allow | deny | warn | route | escalate).
     #[arg(long)]
     action: Option<String>,
     /// Replace the released-secret list (repeatable).
@@ -382,6 +410,10 @@ struct StatsArgs {
     /// Print today's embeddable one-line summary. Ignores window options.
     #[arg(long)]
     line: bool,
+    /// Print the waste report: dollars identifiably wasted in the window
+    /// (retries, runaway loops, prompt-cache misses) and why.
+    #[arg(long, conflicts_with = "line")]
+    waste: bool,
 }
 
 fn main() -> Result<()> {
@@ -401,6 +433,8 @@ fn main() -> Result<()> {
         Command::Status => status_cmd(),
         Command::Cache => cache_cmd(),
         Command::Budget { usd } => budget_cmd(usd),
+        Command::Plan(args) => plan_cmd(args),
+        Command::Trip { cmd } => trip_cmd(cmd),
         Command::Uninstall(a) => uninstall_cmd(a),
     }
 }
@@ -672,7 +706,7 @@ fn append_release_rule(name: &str, hosts: &[String]) -> Result<()> {
     ));
     let _: policy::Policy =
         toml::from_str(&text).context("appending the rule would break policy.toml; not written")?;
-    config::atomic_write(&path, text.as_bytes())?;
+    decoyrail::policy_edit::write_policy(&text, "vault add --allow-host")?;
     println!("Policy rule '{name}' appended to {}.", path.display());
     Ok(())
 }
@@ -989,7 +1023,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             doc.add(&edit, &anchor)?;
-            doc.save()?;
+            doc.save("policy add")?;
             println!("Added rule '{}'.", a.name);
             after_policy_mutation()?;
         }
@@ -1004,7 +1038,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             let name = doc.set(&a.rule, &edit)?;
-            doc.save()?;
+            doc.save("policy set")?;
             println!("Updated rule '{name}'.");
             after_policy_mutation()?;
         }
@@ -1017,7 +1051,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
                 println!("Aborted; policy unchanged.");
                 return Ok(());
             }
-            let backup = doc.save()?;
+            let backup = doc.save("policy rm")?;
             println!("Removed rule '{name}'. Backup at {}.", backup.display());
             after_policy_mutation()?;
         }
@@ -1035,7 +1069,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             };
             let mut doc = PolicyDoc::load()?;
             let name = doc.move_rule(&a.rule, &anchor)?;
-            doc.save()?;
+            doc.save("policy mv")?;
             println!("Moved rule '{name}'.");
             after_policy_mutation()?;
         }
@@ -1043,11 +1077,11 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             let mut doc = PolicyDoc::load()?;
             if a.fallback {
                 doc.set_escalate_fallback(&a.action)?;
-                doc.save()?;
+                doc.save("policy default --fallback")?;
                 println!("Escalate fallback set to {}.", a.action.to_lowercase());
             } else {
                 doc.set_default(&a.action)?;
-                doc.save()?;
+                doc.save("policy default")?;
                 println!("Default action set to {}.", a.action.to_lowercase());
                 if matches!(policy::Action::parse(&a.action), Ok(policy::Action::Warn)) {
                     println!(
@@ -1075,7 +1109,7 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
                 return Ok(());
             }
             doc.flush();
-            let backup = doc.save()?;
+            let backup = doc.save("policy flush")?;
             println!("Flushed all rules. Backup at {}.", backup.display());
             if matches!(default, policy::Action::Deny) {
                 println!(
@@ -1086,20 +1120,83 @@ fn policy_cmd(cmd: PolicyCmd) -> Result<()> {
             after_policy_mutation()?;
         }
         PolicyCmd::Reset(a) => {
-            policy::Policy::load_or_default()?; // ensure there's something to back up
             if !confirm("Overwrite the policy with the shipped defaults?", a.yes)? {
                 println!("Aborted; policy unchanged.");
                 return Ok(());
             }
-            let backup = decoyrail::policy_edit::write_policy(policy::DEFAULT_POLICY_TOML)?;
-            println!(
-                "Policy reset to the shipped defaults. Previous policy backed up at {}.",
-                backup.display()
-            );
+            // The unchecked install on purpose: reset is the recovery path
+            // out of an untrusted or deleted policy, and what it writes is
+            // the shipped default, not anything derived from the file.
+            let backup =
+                decoyrail::integrity::install(policy::DEFAULT_POLICY_TOML, "policy reset")?;
+            if backup.exists() {
+                println!(
+                    "Policy reset to the shipped defaults. Previous policy backed up at {}.",
+                    backup.display()
+                );
+            } else {
+                println!("Policy reset to the shipped defaults.");
+            }
             after_policy_mutation()?;
         }
         PolicyCmd::Edit => policy_edit()?,
+        PolicyCmd::Sign => policy_sign()?,
     }
+    Ok(())
+}
+
+/// `decoyrail policy sign`: bless a hand-edited policy. Shows what changed
+/// against the last trusted version, asks for confirmation on a TTY, and
+/// refuses to run without one; scripting around the review on purpose is
+/// the user's choice to make interactively, not a flag.
+fn policy_sign() -> Result<()> {
+    use decoyrail::integrity::{self, Verdict};
+    use std::io::IsTerminal;
+
+    // Materializes a trusted default on a fresh home, and refuses broken
+    // TOML before anything else: blessing a typo would turn it into a
+    // deny-all surprise at the next restart.
+    policy::Policy::load_or_default()?;
+    let path = config::policy_path()?;
+    let text = std::fs::read_to_string(&path)?;
+    if integrity::verify(&text)? == Verdict::Trusted {
+        println!("Policy already trusted; nothing to bless.");
+        return Ok(());
+    }
+    match integrity::baseline()? {
+        Some((old, at)) => {
+            let changes = integrity::diff(&old, &text);
+            if changes.is_empty() {
+                println!("No line-level changes since the last blessing ({at}); the files differ only in bytes lines don't show (line endings, a trailing newline).");
+            } else {
+                println!("Changes since the last blessed policy ({at}):");
+                for line in &changes {
+                    println!("  {line}");
+                }
+            }
+        }
+        None => println!(
+            "No trusted baseline to diff against; review {} in full before confirming.",
+            path.display()
+        ),
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "refusing to bless without a terminal: `decoyrail policy sign` wants \
+             a human to review the changes above and confirm interactively"
+        ));
+    }
+    eprint!("Bless this policy for this machine? [y/N] ");
+    use std::io::Write as _;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Aborted; nothing blessed.");
+        return Ok(());
+    }
+    let fp = integrity::bless_current()?;
+    println!("Policy blessed (sha256={fp}). A running proxy picks it up on the next request.");
     Ok(())
 }
 
@@ -1153,7 +1250,12 @@ fn after_policy_mutation() -> Result<()> {
 fn print_policy_lint() -> Result<()> {
     let policy = policy::Policy::load_or_default()?;
     let vault = Vault::load_or_init()?;
-    for w in policy.lint(&vault.secrets) {
+    let pricing = pricing::Pricing::load()?;
+    for w in policy
+        .lint(&vault.secrets)
+        .into_iter()
+        .chain(policy.lint_routes(&pricing))
+    {
         eprintln!("decoyrail: policy warning: {w}");
     }
     Ok(())
@@ -1163,6 +1265,12 @@ fn print_policy_lint() -> Result<()> {
 /// default action and escalate fallback.
 fn policy_ls(json: bool) -> Result<()> {
     let policy = policy::Policy::load_or_default()?;
+    // Whether the file on disk is currently trusted, so "will my next
+    // restart work" is answerable without restarting.
+    let trusted = {
+        let text = std::fs::read_to_string(config::policy_path()?)?;
+        decoyrail::integrity::verify(&text)? == decoyrail::integrity::Verdict::Trusted
+    };
     if json {
         let rules: Vec<_> = policy
             .rules
@@ -1177,6 +1285,7 @@ fn policy_ls(json: bool) -> Result<()> {
                     "methods": r.methods,
                     "path_prefixes": r.path_prefixes,
                     "allow_secrets": r.allow_secrets,
+                    "route": r.route,
                 })
             })
             .collect();
@@ -1185,6 +1294,7 @@ fn policy_ls(json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "default_action": policy.default_action.as_str(),
                 "escalate_fallback": policy.escalate_fallback.as_str(),
+                "trusted": trusted,
                 "rules": rules,
             }))?
         );
@@ -1211,6 +1321,9 @@ fn policy_ls(json: bool) -> Result<()> {
         if !r.allow_secrets.is_empty() {
             extra.push(format!("releases: {}", r.allow_secrets.join(", ")));
         }
+        if !r.route.is_empty() {
+            extra.push(format!("routes: {}", fmt_route_map(&r.route)));
+        }
         if !extra.is_empty() {
             println!("     {}", extra.join("  |  "));
         }
@@ -1220,6 +1333,14 @@ fn policy_ls(json: bool) -> Result<()> {
         policy.default_action.as_str(),
         policy.escalate_fallback.as_str()
     );
+    if trusted {
+        println!("integrity: trusted (the proxy loads this file)");
+    } else {
+        println!(
+            "integrity: NOT TRUSTED. The file was changed outside decoyrail; the proxy \
+             will not load it. Review it, then run `decoyrail policy sign`."
+        );
+    }
     print_policy_lint()?;
     Ok(())
 }
@@ -1257,7 +1378,9 @@ fn policy_test(url: &str, method: &str) -> Result<()> {
             .filter(|s| d.releases(s))
             .map(|s| s.name.as_str())
             .collect();
-        if d.action == policy::Action::Allow {
+        // A route rule releases exactly like allow (the rewrite touches only
+        // the model field, never the credential).
+        if matches!(d.action, policy::Action::Allow | policy::Action::Route) {
             if released.is_empty() {
                 println!(
                     "  secrets: rule lists [{}]; no matching vault secret to release",
@@ -1278,7 +1401,18 @@ fn policy_test(url: &str, method: &str) -> Result<()> {
             );
         }
     }
+    if !d.route.is_empty() {
+        println!("  routes: {}", fmt_route_map(&d.route));
+    }
     Ok(())
+}
+
+/// Render a route map for human output: `from -> to`, comma-separated.
+fn fmt_route_map(map: &std::collections::BTreeMap<String, String>) -> String {
+    map.iter()
+        .map(|(f, t)| format!("{f} -> {t}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Split a URL or bare host into (host, path). Scheme, userinfo, and port are
@@ -1327,7 +1461,7 @@ fn policy_edit() -> Result<()> {
         }
         // Validate before it replaces the live file; on a parse error the live
         // policy stays put.
-        decoyrail::policy_edit::write_policy(&edited)
+        decoyrail::policy_edit::write_policy(&edited, "policy edit")
             .context("edited policy rejected; the live policy is unchanged")?;
         println!("Policy updated.");
         after_policy_mutation()?;
@@ -1385,7 +1519,7 @@ fn dlp_cmd(cmd: DlpCmd) -> Result<()> {
                 toml_edit::value(mode.clone())
             };
             // Edit in place, preserving the user's comments and rule layout;
-            // validate the result parses before it replaces the live policy.
+            // write_policy validates the result and leaves it trusted.
             let path = config::policy_path()?;
             let text = std::fs::read_to_string(&path)?;
             let mut doc = text
@@ -1393,8 +1527,7 @@ fn dlp_cmd(cmd: DlpCmd) -> Result<()> {
                 .context("parsing policy.toml")?;
             doc["dlp"][detector.as_str()] = value;
             let edited = doc.to_string();
-            toml::from_str::<policy::Policy>(&edited).context("edited policy failed to parse")?;
-            config::atomic_write(&path, edited.as_bytes())?;
+            decoyrail::policy_edit::write_policy(&edited, "dlp set")?;
             println!("Set {detector} = {mode}. A running proxy picks it up on the next request.");
             if detector == "debug" && matches!(mode.as_str(), "on" | "true") {
                 println!(
@@ -1614,7 +1747,13 @@ fn print_audit_line(line: &str) {
     let Ok(ev) = serde_json::from_str::<audit::AuditEvent>(line) else {
         return;
     };
-    let flag = if !ev.tripwires.is_empty() {
+    // A rejected policy load is the same class of news as a honeytoken
+    // alarm: someone or something edited the release gate out-of-band.
+    let flag = if ev.action == "tamper" {
+        "[TAMP]"
+    } else if !ev.tripwires.is_empty() || ev.note.starts_with("spend tripwire") {
+        // The spend tripwire (plan 002) earns the same prominence as the
+        // honeytoken alarm: both are tripwires, one on secrets, one on cost.
         "[TRIP]"
     } else if ev.action == "deny" {
         "[DENY]"
@@ -1677,6 +1816,16 @@ fn stats_cmd(args: StatsArgs) -> Result<()> {
         "day" => Breakdown::Day,
         other => return Err(anyhow!("bad --by '{other}' (use session|model|host|day)")),
     };
+
+    if args.waste {
+        let report = decoyrail::waste::report(&window)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", decoyrail::waste::render(&report));
+        }
+        return Ok(());
+    }
 
     let report = stats::query(&window)?;
     if args.line {
@@ -1814,6 +1963,89 @@ fn status_cmd() -> Result<()> {
     }
     if meter.over_budget() {
         println!("  BUDGET EXHAUSTED: requests are being denied");
+    } else if meter.budget_usd > 0.0 {
+        // Soft-landing band (plan 003): the session is degraded, say so. The
+        // line appears only when downgrades actually happen, which needs the
+        // policy's [soft_landing] table and a Pro tier.
+        let pct = meter.total_cost().max(0.0) / meter.budget_usd * 100.0;
+        let configured = policy::Policy::load_or_default()
+            .map(|p| p.soft_landing.enabled() && pct >= p.soft_landing.threshold_pct)
+            .unwrap_or(false);
+        let pro = decoyrail::license::load_installed()
+            .ok()
+            .flatten()
+            .is_some_and(|doc| {
+                decoyrail::license::effective_tier(&doc, chrono::Utc::now().date_naive())
+                    >= decoyrail::license::Tier::Pro
+            });
+        if configured && pro {
+            println!(
+                "  SOFT-LANDING: spend at {pct:.0}% of budget; mapped models are being downgraded"
+            );
+        }
+    }
+    // Spend tripwire (plan 002): a standing trip is front-page news, with
+    // the clear path right next to it.
+    if let Ok(Some(trip)) = watch::load_trip() {
+        let blocking = policy::Policy::load_or_default()
+            .map(|p| p.spend_tripwire.mode == policy::TripwireMode::Block)
+            .unwrap_or(true);
+        println!(
+            "  SPEND TRIPWIRE: {}: {}. Clear with `decoyrail trip clear`.",
+            if blocking {
+                "tripped; LLM traffic is blocked"
+            } else {
+                "tripped (alert mode: traffic still flows)"
+            },
+            trip.reason
+        );
+    }
+    // Model router (plan 006): the policy's active route rules, so redirected
+    // traffic is inspectable at a glance. Without a Pro license the rules are
+    // inert (they still allow, models pass through unchanged) and the header
+    // says so.
+    if let Ok(p) = policy::Policy::load_or_default() {
+        let routes: Vec<_> = p
+            .rules
+            .iter()
+            .filter(|r| r.action == policy::Action::Route)
+            .collect();
+        if !routes.is_empty() {
+            let pro = decoyrail::license::load_installed()
+                .ok()
+                .flatten()
+                .is_some_and(|doc| {
+                    decoyrail::license::effective_tier(&doc, chrono::Utc::now().date_naive())
+                        >= decoyrail::license::Tier::Pro
+                });
+            println!(
+                "Route rules{}:",
+                if pro {
+                    ""
+                } else {
+                    " (inert: no Pro license, models pass through unchanged)"
+                }
+            );
+            for r in routes {
+                let map = if r.route.is_empty() {
+                    "(empty map; behaves like allow)".to_string()
+                } else {
+                    fmt_route_map(&r.route)
+                };
+                println!("  {}: {}  [{}]", r.name, map, r.hosts.join(", "));
+            }
+        }
+    }
+    // Reference dollars are their own labeled line, never a share of Spend,
+    // and the budget above never sees them.
+    let absorbed = meter.plan_absorbed().max(0.0);
+    if absorbed > 0.0 {
+        println!(
+            "Plan-absorbed: ~${absorbed:.4} API-equivalent (subscription traffic, not billed)"
+        );
+    }
+    if let Ok(Some(price)) = meter::load_plan_price() {
+        println!("Plan: {}", meter::plan_verdict(&price, absorbed));
     }
     if meter.per_host.is_empty() {
         println!("No traffic recorded this period.");
@@ -1863,7 +2095,11 @@ fn status_cmd() -> Result<()> {
                             String::new()
                         };
                         let cost = if model.ends_with("[subscription]") {
-                            "plan-covered".to_string()
+                            if m.ref_cost_usd > 0.0 {
+                                format!("plan-covered (~${:.4} API-equivalent)", m.ref_cost_usd)
+                            } else {
+                                "plan-covered".to_string()
+                            }
                         } else {
                             format!("${:.4}", m.cost_usd)
                         };
@@ -1954,11 +2190,19 @@ fn cache_cmd() -> Result<()> {
             }
             // The doctor doesn't split by billing mode, so a model with both
             // a usage row and a subscription row gets its hygiene block once,
-            // on whichever row prints first.
+            // on whichever row prints first (the waste framing follows that
+            // row's billing).
             let doctor_key = format!("{host} {model}");
             if !seen_keys.contains(&doctor_key) {
                 if let Some(s) = stats.per_key.get(&doctor_key) {
-                    print_hygiene(s);
+                    let waste = provider.map(|p| {
+                        let rate = pricing.rate_for(p, Some(model));
+                        (
+                            cache::repairable_waste_usd(s.repairable_bytes, &rate),
+                            subscription,
+                        )
+                    });
+                    print_hygiene(s, waste);
                     seen_keys.push(doctor_key);
                 }
             }
@@ -1972,7 +2216,7 @@ fn cache_cmd() -> Result<()> {
         }
         printed_any = true;
         println!("\n{key}");
-        print_hygiene(s);
+        print_hygiene(s, None);
     }
 
     if !printed_any {
@@ -1984,8 +2228,11 @@ fn cache_cmd() -> Result<()> {
     Ok(())
 }
 
-/// One model's hygiene lines from the doctor's counters.
-fn print_hygiene(s: &cache::KeyStats) {
+/// One model's hygiene lines from the doctor's counters. `waste` prices the
+/// repairable re-billed prefix when the caller had a rate: the dollars and
+/// whether the row is plan-covered, so subscription waste is framed as
+/// headroom at reference rates instead of billed dollars (plan 019).
+fn print_hygiene(s: &cache::KeyStats, waste: Option<(f64, bool)>) {
     println!(
         "  hygiene: {} requests ({} with cache markers); prefix preserved {}, new-conversation resets {}, diverged {}, past the 5-min TTL {}, below cacheable minimum {}",
         s.requests, s.marked, s.preserved, s.resets, s.diverged, s.ttl_gaps, s.below_min
@@ -2014,6 +2261,16 @@ fn print_hygiene(s: &cache::KeyStats) {
             "  repair: {} requests carried a repeating prefix with no cache marker; {} repaired",
             s.repairable, s.repaired
         );
+        match waste {
+            Some((usd, true)) if usd > 0.0 => println!(
+                "    that re-billed prefix burned ~${usd:.4} of API-equivalent input: \
+                 plan headroom spent on avoidable cache misses"
+            ),
+            Some((usd, false)) if usd > 0.0 => {
+                println!("    that re-billed prefix wasted ~${usd:.4} against cache-read pricing")
+            }
+            _ => {}
+        }
         if s.repaired == 0 {
             println!(
                 "    Decoyrail can inject those markers for you (Pro): set `[cache] repair = true` \
@@ -2021,6 +2278,111 @@ fn print_hygiene(s: &cache::KeyStats) {
             );
         }
     }
+}
+
+/// Declare, show, or clear the local plan price (plan 019). Bare `decoyrail
+/// plan` reads this period's plan-absorbed total against the declared price;
+/// the price is one local setting the user owns, never guessed.
+fn trip_cmd(cmd: Option<TripCmd>) -> Result<()> {
+    match cmd {
+        None => match watch::load_trip()? {
+            None => println!("Spend tripwire: clear (no trip in force)."),
+            Some(t) => {
+                let when = if t.ts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at {}", t.ts)
+                };
+                println!("Spend tripwire: TRIPPED{when}");
+                println!("  {}", t.reason);
+                if !t.sid.is_empty() {
+                    println!("  tripped by session: {}", t.sid);
+                }
+                let mode = policy::Policy::load_or_default()
+                    .map(|p| p.spend_tripwire.mode)
+                    .unwrap_or(policy::TripwireMode::Block);
+                match mode {
+                    policy::TripwireMode::Block => {
+                        println!("  LLM-bound traffic is blocked while the trip stands.")
+                    }
+                    _ => println!(
+                        "  Traffic still flows (policy mode is not \"block\"); \
+                         the trip is on record."
+                    ),
+                }
+                println!("  Clear with `decoyrail trip clear`.");
+            }
+        },
+        Some(TripCmd::Clear) => {
+            if watch::load_trip()?.is_none() {
+                println!("No spend trip to clear.");
+                return Ok(());
+            }
+            watch::clear_trip()?;
+            // Clearing an enforcement state is audit-worthy news, same as
+            // setting one: the log should show who turned the alarm off.
+            let mut a = audit::Auditor::open()?;
+            a.append(
+                audit::Entry::note("trip", "spend tripwire cleared by operator".into()),
+                util::now_rfc3339(),
+            )?;
+            println!("Spend trip cleared; LLM traffic resumes.");
+        }
+    }
+    Ok(())
+}
+
+fn plan_cmd(args: PlanArgs) -> Result<()> {
+    if args.clear {
+        meter::clear_plan_price()?;
+        println!("Plan price cleared.");
+        return Ok(());
+    }
+    let existing = meter::load_plan_price()?;
+    if args.price.is_none() && args.label.is_none() {
+        let mut m = meter::Meter::load()?;
+        m.roll_period(&util::current_period());
+        let absorbed = m.plan_absorbed().max(0.0);
+        match existing {
+            Some(p) => println!("{}", meter::plan_verdict(&p, absorbed)),
+            None => {
+                if absorbed > 0.0 {
+                    println!(
+                        "Plan-absorbed this period: ~${absorbed:.4} API-equivalent \
+                         (subscription traffic, not billed)."
+                    );
+                } else {
+                    println!("No plan-covered traffic this period.");
+                }
+                println!(
+                    "No plan price declared. Set one with \
+                     `decoyrail plan --price 200 --label \"Claude Max\"` to see \
+                     what the plan absorbs against what it costs."
+                );
+            }
+        }
+        return Ok(());
+    }
+    let usd = match (args.price, &existing) {
+        (Some(usd), _) => usd,
+        (None, Some(p)) => p.usd,
+        (None, None) => return Err(anyhow!("no plan price declared yet; pass --price")),
+    };
+    // `<= 0.0` alone would let NaN through; require a real positive number.
+    if usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        return Err(anyhow!(
+            "plan price must be a positive dollar amount; use --clear to remove it"
+        ));
+    }
+    let label = args.label.or(existing.map(|p| p.label)).unwrap_or_default();
+    let price = meter::PlanPrice { usd, label };
+    meter::save_plan_price(&price)?;
+    if price.label.is_empty() {
+        println!("Plan price set: ${usd:.2}/mo.");
+    } else {
+        println!("Plan price set: {} at ${usd:.2}/mo.", price.label);
+    }
+    Ok(())
 }
 
 fn budget_cmd(usd: f64) -> Result<()> {

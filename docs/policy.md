@@ -6,12 +6,13 @@ created with a default pack on first run and hot-reloaded by a running proxy.
 
 ```sh
 decoyrail policy show               # print the current policy
-$EDITOR "$(decoyrail policy path)"  # edit it; a running proxy picks it up
+$EDITOR "$(decoyrail policy path)"  # edit it by hand...
+decoyrail policy sign               # ...then bless the edit; the proxy picks it up
 ```
 
-You can also drive the rules from the command line, the way `iptables` does,
-without opening the file. Every write validates before it lands; see
-[Editing from the CLI](#editing-from-the-cli) below.
+You can also drive the rules from the command line, the way `iptables` does, without opening the file. Every write validates before it lands and needs no blessing; see [Editing from the CLI](#editing-from-the-cli) below.
+
+The policy is the gate that decides where real secrets go, so the proxy loads only a policy that Decoyrail itself wrote or that you blessed with `decoyrail policy sign`; a file changed any other way fails closed. See [Integrity](#integrity-out-of-band-edits-never-load).
 
 ## File format
 
@@ -24,8 +25,9 @@ name = "anthropic"                     # label; shows up in `decoyrail log`
 hosts = ["api.anthropic.com"]          # required; glob per entry
 methods = ["POST"]                     # optional; empty = any method
 path_prefixes = ["/v1"]                # optional; empty = any path
-action = "allow"                       # allow | deny | warn | escalate
+action = "allow"                       # allow | deny | warn | route | escalate
 allow_secrets = ["anthropic"]          # optional; secrets released here
+# route = { "claude-opus-4" = "claude-sonnet-5" }  # model map; route rules only
 
 [dlp]                                  # sensitive-data detectors
 pan = "warn"                           # block | mask | warn | off
@@ -35,6 +37,13 @@ aba = "warn"
 email = "off"
 # allow = ["4111 1111 1111 1111"]      # fixture values the detectors ignore
 # debug = true                         # dump hit payloads for inspection
+
+[spend_tripwire]                       # runaway-loop breaker (on by default)
+mode = "block"                         # block | alert | off
+repeats = 15                           # identical requests in the window that trip
+window_secs = 300                      # sliding window for both detectors
+rate_multiplier = 10.0                 # spend rate vs the session baseline; 0 = off
+rate_floor_usd = 5.0                   # and at least this many dollars in the window
 ```
 
 ## Evaluation: top to bottom, first match wins
@@ -153,6 +162,37 @@ Its main use is as the default action while you tune a policy. With `default_act
 
 Be honest with yourself about the tradeoff: warn does not block the exfiltration of non-secret data (source code, prompts) to unlisted hosts, it records it. The shipped default stays deny, and the [threat model](threat-model.md#warn-mode-records-it-does-not-block) spells this out. Treat warn as the tuning posture with an exit, not a place to live: watch the log, add rules, go back to deny.
 
+## `route`: allow, on a cheaper model (Pro)
+
+`route` is the model router (the standing-policy sibling of the [budget soft-landing](audit-and-metering.md#budget-soft-landing-pro)). A route rule allows exactly like `allow`, and additionally rewrites the requested model per its explicit map before the request forwards:
+
+```toml
+[[rule]]
+name = "anthropic-cheap-tier"
+hosts = ["api.anthropic.com"]
+action = "route"
+allow_secrets = ["provider:anthropic"]
+route = { "claude-opus-4" = "claude-sonnet-5" }
+```
+
+Policy-wise it is an allow. Secrets release through `allow_secrets` the same way, first-match-wins ordering applies unchanged (a deny or escalate rule above it wins), and a tripwire, a blocking DLP hit, or an exhausted budget denies a routed request exactly as it denies an allowed one. Security verbs always outrank the route.
+
+The map is yours, like the soft-landing map: Decoyrail has no built-in opinion about which models are equivalent. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A rule with no map, or a request whose model is absent, unmapped, or unidentifiable, forwards unmodified. Never an error, never a guess.
+
+Rewrites never happen silently:
+
+- every rewritten request gets a `route` audit event naming the rule and the mapping,
+- the response carries an `x-decoyrail-route: <from> -> <to>` header,
+- `decoyrail status` lists the policy's route rules and says when they are inert for want of a license.
+
+Provider prompt caches are model-scoped, so a rewrite abandons any warm cache for the original model; the audit note says so, and when the [cache doctor](audit-and-metering.md#the-prompt-cache-report) knows a warm prefix for that model it prices what the rewrite forfeits, so a route that costs more than it saves is visible instead of mysterious. A map that names a target model the pricing table doesn't know still forwards as configured (the provider errors informatively); the audit note and the policy lint flag the likely typo, as does a route rule whose map is empty.
+
+When the budget soft-landing is also active and the session is in its band, soft-landing rewrites first and the route map applies to the result, so the map is always consulted against the model actually about to forward. Both rewrites get their own audit events.
+
+This is a Pro feature, and the gate moves in only one direction: without a license the rule still allows (license state never changes what is reachable), the model just rides through untouched.
+
+`decoyrail policy add my-rule --host api.anthropic.com --action route` creates a route rule from the CLI; the map itself is edited in the file (`decoyrail policy edit`, or a hand edit plus `decoyrail policy sign`), which validates it like any other policy change.
+
 ## `escalate`: fails closed today, judge later
 
 `escalate` marks a destination as "needs a second opinion": pastebins,
@@ -195,14 +235,34 @@ traffic (`decoyrail dlp set pan block`).
 Run `decoyrail policy show` to see the live version. The file on disk is the
 source of truth.
 
+## `[cache]`: the Pro cache controls
+
+The free [prompt-cache doctor](audit-and-metering.md#the-prompt-cache-report) always runs and only observes. The `[cache]` table is how you switch on the three active behaviors it diagnoses for, described in [Cache repair and active management](audit-and-metering.md#cache-repair-and-active-management-pro). Each one needs two things: the knob set here, and a Pro license installed. Without a license the knobs are inert and every request passes through byte-identical; nothing errors and nothing blocks.
+
+```toml
+[cache]
+repair = true              # splice a cache_control marker when a prefix repeats unmarked
+keep_alive = true          # pre-warm a warm cache during idle so it survives a long build
+keep_alive_secs = 240      # idle seconds before a pre-warm fires (default sits under the 5m TTL)
+keep_alive_max = 6         # pre-warms per prefix per session; a real request resets the count
+serialize_fanout = true    # parallel same-prefix requests: one cache write, the rest read it
+fanout_timeout_ms = 2000   # how long a held request waits for the leader before proceeding
+```
+
+Everything defaults to off or to the safe value shown, and the table hot-reloads like the rest of the policy. Every marker injection and every proxy-initiated pre-warm lands in the audit log (`cache` and `keepalive` events), and `decoyrail cache` reports what the active layer actually did.
+
+These are cost knobs, not security knobs: a `[cache]` table can never release a secret, loosen a rule, or keep a deny from denying. A pre-warm the proxy initiates runs the full policy and swap pipeline, exactly like a request your agent sent.
+
 ## Editing from the CLI
 
 The file is always yours to edit by hand, but for routine changes the
 `decoyrail policy` subcommands do the same edits without an editor, and they
 keep you from writing a policy the proxy would refuse. Every mutation validates
 that the result still parses, preserves the comments and the rules it doesn't
-touch, keeps a single most-recent backup at `policy.toml.bak`, and replaces the
-file atomically so a running proxy never reads a half-written policy.
+touch, keeps a single most-recent backup at `policy.toml.bak`, replaces the
+file atomically so a running proxy never reads a half-written policy, and
+leaves the file [trusted](#integrity-out-of-band-edits-never-load) with an
+audit event recording the change, so no blessing step is needed.
 
 ### Reading
 
@@ -262,6 +322,32 @@ you make the change, not at the next load.
 `--yes` when run from a script. Any command that fails leaves the file
 untouched and exits non-zero, so you can chain them safely in a shell script.
 
+## Integrity: out-of-band edits never load
+
+Every policy Decoyrail writes gets a record next to it, `policy.toml.sig`: a keyed checksum over the exact file bytes, with the key derived from the same vault key that encrypts your secrets. The proxy loads a policy only when that record verifies. There is no flag for this and no off switch; it applies in every home, and its strength tracks the vault-key backend you already chose (a keychain-held key on macOS after `decoyrail key migrate --to keychain`, a `0600` file otherwise). `decoyrail key migrate` moves both protections together.
+
+Hand edits stay a supported workflow, one command longer:
+
+```sh
+$EDITOR "$(decoyrail policy path)"   # edit the file
+decoyrail policy sign                # review the diff, confirm, done
+```
+
+`policy sign` shows what changed against the last trusted version and asks for confirmation. It only runs on a terminal: the point is that a human read the diff. Signing a file that is already trusted is a quiet no-op, and signing one that does not parse is refused, so a typo cannot become a deny-all surprise at the next restart.
+
+What happens when the file does not verify:
+
+- At startup, the proxy refuses to run and tells you what to do (review, then `decoyrail policy sign`). The refusal is also written to the audit log as a `tamper` event.
+- On a running proxy, the last good policy stays in force and the rejection lands in the audit log as a `tamper` event; `decoyrail log -t` renders it as `[TAMP]`, with the same prominence as a honeytoken alarm.
+- `decoyrail policy ls` prints whether the file on disk is currently trusted, so "will my next restart work" is answerable without restarting.
+- CLI mutations (`policy add`, `dlp set`, ...) refuse to build on an untrusted file, so they cannot silently launder a tamper; `policy sign` and `policy reset` are the two ways back to a trusted state.
+
+Deleting `policy.toml.sig`, deleting `policy.toml` while the record exists, or copying a policy plus record from another home all fail closed the same way. Restoring a tampered file byte-for-byte makes it load again with no blessing, since the record covers the exact bytes.
+
+After an upgrade from a version without integrity records, the first start refuses with the same instructive error: review your policy once, run `decoyrail policy sign`, and you are done.
+
+Honesty note: this is detection, not a cage. Whoever can run code as you can run `decoyrail policy set` themselves; the difference is that the change then rides Decoyrail's own audited path and shows up in the log and the live tail. On the file key backend, an attacker who reads `vault.key` can forge the record too, exactly as they could already open the vault. The [threat model](threat-model.md) spells this out.
+
 ## Interaction with the rest of the pipeline
 
 Policy is necessary but not sufficient for a request to leave:
@@ -273,6 +359,9 @@ Policy is necessary but not sufficient for a request to leave:
   or warned host.
 - An **exhausted budget** denies everything until the month rolls over or
   the budget is raised.
+- A **[spend tripwire](audit-and-metering.md#the-spend-tripwire) trip**
+  denies LLM-bound traffic (in `block` mode) until an explicit
+  `decoyrail trip clear`; non-LLM egress keeps flowing.
 - An **allow** without `allow_secrets` does not swap anything: the host is
   reachable, but every credential stays a decoy. The swap additionally
   requires TLS transport and the right

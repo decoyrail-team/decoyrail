@@ -1,7 +1,8 @@
 #![no_main]
 //! Fuzz the decoy<->real swap engine with the core security invariant as an
 //! assert: a real secret appears in the outbound request only when the
-//! winning decision is allow, releases it, AND the transport is TLS.
+//! winning decision is allow (or route, which releases identically),
+//! releases it, AND the transport is TLS.
 //! Everything else (deny, warn, no release, plaintext) must leave the bytes
 //! free of every real value, whatever the surrounding input looks like.
 
@@ -69,10 +70,14 @@ fuzz_target!(|input: Input| {
         }
     }
 
-    let action = match input.action % 3 {
+    let action = match input.action % 4 {
         0 => Action::Allow,
         1 => Action::Deny,
-        _ => Action::Warn,
+        2 => Action::Warn,
+        // Route is allow plus a model rewrite that runs before the swap and
+        // never touches a credential: the release invariant must hold for it
+        // exactly as for allow.
+        _ => Action::Route,
     };
     let decision = Decision {
         action,
@@ -83,6 +88,7 @@ fuzz_target!(|input: Input| {
         } else {
             Vec::new()
         },
+        route: Default::default(),
     };
 
     // Splice every decoy (and one base64-encoded decoy, for the encoded-form
@@ -122,10 +128,11 @@ fuzz_target!(|input: Input| {
         let _ = t.message("fuzz.example");
     }
 
-    // The invariant: without (release AND allow AND TLS), no real value may
-    // exist anywhere in the request the proxy would forward. Warn forwards
-    // like allow but sits on the unreleased side, always.
-    let released = input.release && action == Action::Allow && input.tls;
+    // The invariant: without (release AND allow/route AND TLS), no real
+    // value may exist anywhere in the request the proxy would forward. Warn
+    // forwards like allow but sits on the unreleased side, always.
+    let released =
+        input.release && matches!(action, Action::Allow | Action::Route) && input.tls;
     if !released {
         for s in &vault.secrets {
             assert!(

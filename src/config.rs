@@ -124,6 +124,13 @@ pub fn policy_backup_path() -> Result<PathBuf> {
     Ok(home()?.join("policy.toml.bak"))
 }
 
+/// The policy integrity record (see `integrity.rs`): proof that policy.toml
+/// was written or blessed by Decoyrail for this home. Absence or mismatch
+/// makes the proxy fail closed; deleting it is treated as tampering.
+pub fn policy_sig_path() -> Result<PathBuf> {
+    Ok(home()?.join("policy.toml.sig"))
+}
+
 pub fn audit_path() -> Result<PathBuf> {
     Ok(home()?.join("audit.jsonl"))
 }
@@ -148,6 +155,18 @@ pub fn budget_path() -> Result<PathBuf> {
 /// Optional per-model pricing overrides (hosts, rates, billing); hot-reloaded.
 pub fn pricing_path() -> Result<PathBuf> {
     Ok(home()?.join("pricing.json"))
+}
+
+/// User-declared subscription plan price (plan 019). Its own file with one
+/// writer (`decoyrail plan`), so neither budget nor meter writes touch it.
+pub fn plan_path() -> Result<PathBuf> {
+    Ok(home()?.join("plan.json"))
+}
+
+/// The spend tripwire's persisted trip state (plan 002). Absence is the
+/// defined clear state; `decoyrail trip clear` removes it, nothing expires it.
+pub fn trip_path() -> Result<PathBuf> {
+    Ok(home()?.join("trip.json"))
 }
 
 /// The installed license file (signed, offline; see `license.rs`). Absence is

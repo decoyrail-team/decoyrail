@@ -365,6 +365,27 @@ fn keychain_key_from(store: &dyn KeyStore) -> Result<[u8; 32]> {
     }
 }
 
+/// Key for the policy integrity MAC (`integrity.rs`), derived from the vault
+/// key by HMAC under a fixed domain label. Deriving (instead of minting a
+/// second key) means the policy's protection inherits the vault key's
+/// backend: `decoyrail key migrate` moves both together, and forging a
+/// policy record requires the same theft as opening the vault. The
+/// derivation rides `load_or_create_key`, so a selected-but-failed keychain
+/// read aborts here exactly like it does for the vault.
+pub fn policy_mac_key() -> Result<Zeroizing<[u8; 32]>> {
+    use hmac::{Hmac, Mac};
+    let mut vault_key = load_or_create_key()?;
+    // `as Mac`: KeyInit is also in scope here for the vault cipher.
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(&vault_key).expect("any key size works");
+    vault_key.zeroize();
+    mac.update(b"decoyrail-policy-integrity-v1");
+    let digest = mac.finalize().into_bytes();
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
 // --- key backend migration -------------------------------------------------
 
 /// Key storage the migration commands run against. A trait so the migration

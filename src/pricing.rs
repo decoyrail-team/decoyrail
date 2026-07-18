@@ -210,6 +210,16 @@ impl Pricing {
             .unwrap_or_else(|| provider.default_rate())
     }
 
+    /// Is `model` covered by the pricing table (any prefix entry matches)?
+    /// The soft-landing downgrade (plan 003) uses this to flag a map naming
+    /// a model nothing prices — likely a typo the provider will reject. The
+    /// request forwards as configured either way; this only shapes the log.
+    pub fn knows_model(&self, model: &str) -> bool {
+        self.models
+            .keys()
+            .any(|prefix| model.starts_with(prefix.as_str()))
+    }
+
     /// How this request is billed. An explicit `pricing.json` override wins;
     /// otherwise Anthropic requests authenticated with OAuth (`Authorization:
     /// Bearer`, no `x-api-key`) are Claude-plan subscription traffic, and
@@ -237,6 +247,19 @@ impl Pricing {
             }
         }
         Billing::Usage
+    }
+}
+
+/// Split one request's token cost into (billable, reference) dollars.
+/// Usage-billed tokens cost real money and have no reference figure;
+/// subscription tokens cost nothing but carry what the same tokens would
+/// have billed at API rates (plan 019). Exactly one side is ever nonzero,
+/// so no total can sum the two by accident.
+pub fn split_cost(billing: Billing, usage: &TokenUsage, rate: &ModelRate) -> (f64, f64) {
+    let api = usage.cost_usd(rate);
+    match billing {
+        Billing::Usage => (api, 0.0),
+        Billing::Subscription => (0.0, api),
     }
 }
 
@@ -434,6 +457,15 @@ mod tests {
     }
 
     #[test]
+    fn knows_model_matches_prefixes_only() {
+        let p = Pricing::default();
+        assert!(p.knows_model("claude-sonnet-5"));
+        assert!(p.knows_model("claude-sonnet-5-20250929"), "dated release");
+        assert!(!p.knows_model("totally-unknown-model"));
+        assert!(!p.knows_model(""));
+    }
+
+    #[test]
     fn longest_prefix_wins() {
         let p = Pricing::default();
         let mini = p.rate_for(Provider::OpenAi, Some("gpt-5-mini-2025-08-07"));
@@ -623,6 +655,24 @@ mod tests {
             p.provider_for_host("api.openai.com"),
             Some(Provider::OpenAi)
         );
+    }
+
+    #[test]
+    fn split_cost_never_mixes_billable_and_reference() {
+        let rate = Pricing::default().rate_for(Provider::Anthropic, Some("claude-sonnet-5"));
+        let u = TokenUsage {
+            input: 1000,
+            output: 200,
+            cache_read: 5000,
+            cache_write: 100,
+        };
+        let api = u.cost_usd(&rate);
+        assert!(api > 0.0);
+        // Usage-billed: real cost, no reference figure.
+        assert_eq!(split_cost(Billing::Usage, &u, &rate), (api, 0.0));
+        // Subscription: zero marginal cost, full API-equivalent reference —
+        // cache reads and writes priced at their own multipliers.
+        assert_eq!(split_cost(Billing::Subscription, &u, &rate), (0.0, api));
     }
 
     #[test]

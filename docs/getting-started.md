@@ -239,8 +239,11 @@ a starter pack for coding agents on first run.
 
 ```sh
 decoyrail policy show                # print the current policy
-$EDITOR "$(decoyrail policy path)"   # edit it
+$EDITOR "$(decoyrail policy path)"   # edit it by hand...
+decoyrail policy sign                # ...then bless the edit (review + confirm)
 ```
+
+The proxy loads only a policy Decoyrail wrote or you blessed; a file changed any other way fails closed until you sign it. The `decoyrail policy` subcommands (below) need no blessing. Details in the [policy reference](policy.md#integrity-out-of-band-edits-never-load).
 
 Rules are evaluated top to bottom; the first match wins:
 

@@ -35,7 +35,7 @@ doing and why something was denied.
 
 | Field | Meaning |
 |---|---|
-| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), or `keepalive` (a proxy-initiated cache pre-warm, Pro) |
+| `action` | `allow`, `warn` (forwarded under the [warn action](policy.md#warn-forward-but-say-so), no secret released), `deny`, `alert` (real secret echoed in a response, or a config hot-reload failure), `tamper` (a policy load rejected because the file failed integrity verification), `policy` (a policy write or blessing through a Decoyrail surface; the note carries the file's sha256), `session` (a `decoyrail run` or `proxy` launch, labeled in `note`), `usage` (deferred token counts for a streamed response), `cache` (a prompt-cache marker injected, Pro), `keepalive` (a proxy-initiated cache pre-warm, Pro), `downgrade` (a budget soft-landing model rewrite, Pro), or `route` (a [model-router](policy.md#route-allow-on-a-cheaper-model-pro) rewrite, Pro; the note names the mapping and prices any warm prompt cache it forfeits) |
 | `rule` | the policy rule that decided it (`default` when nothing matched) |
 | `escalated` | the matching rule said `escalate` (resolved via fallback) |
 | `swaps` | secrets substituted, as `name@location` |
@@ -46,7 +46,7 @@ doing and why something was denied.
 | `sid` | session id of the recording process, stable where pids get reused; what `decoyrail stats --by session` groups on |
 | `dur_ms` | request duration in milliseconds; on streamed responses it moves to the companion `usage` event so nothing is measured twice |
 | `bytes_up`, `bytes_down` | request and response sizes as seen at the proxy (omitted when zero) |
-| `usage` | structured token counts and cost for LLM requests: `{model, input, output, cache_read, cache_write, cost_usd}` |
+| `usage` | structured token counts and cost for LLM requests: `{model, input, output, cache_read, cache_write, cost_usd, ref_cost_usd}` (`ref_cost_usd` is the API-equivalent reference for subscription traffic, present only when nonzero) |
 | `req_seq` | on `usage` events: the `seq` of the allow or warn event the counts belong to |
 
 The analytics fields (`sid` through `req_seq`) exist so `decoyrail stats`
@@ -147,10 +147,32 @@ means an OAuth `Authorization: Bearer` with no `x-api-key`, the shape
 Claude Code sends when signed into a Claude plan. Its tokens still show in `status`, in full; they just
 don't burn the budget, because a flat plan adds no per-request bill. That
 isn't the same as free: plan allowances are finite, heavy sessions hit plan
-limits, and usage beyond the plan bills at API rates. An API-equivalent
-reference cost for subscription traffic is on the [roadmap](../ROADMAP.md),
-so you'll be able to see what your plan absorbed and how close you are to
-outgrowing it.
+limits, and usage beyond the plan bills at API rates.
+
+So every subscription request also carries a **reference cost**: what the
+same tokens would have billed at API rates, cache reads and writes priced
+at their own multipliers, from the same pricing table as billed traffic.
+`status` and `stats` show the total as "plan-absorbed", always labeled
+API-equivalent and never summed into spend; the budget and its kill switch
+see only billable dollars. It is a reference, what the plan absorbed, not a
+savings claim: providers don't publish plan allowances, so Decoyrail never
+invents a "percent of plan used".
+
+If you tell Decoyrail what the plan costs, it reads the absorbed total
+against that price:
+
+```sh
+decoyrail plan --price 200 --label "Claude Max"   # declare what you pay
+decoyrail plan          # what the plan absorbed this period, vs its price
+decoyrail plan --clear  # remove the declared price
+```
+
+With a price declared, `status` and `plan` state one of two things: the
+plan absorbed more API-equivalent usage than it costs (it is paying for
+itself), or how much of its headroom went unused this period. With no
+price declared you get the totals and no verdict. The price is a local
+setting you own; if the provider reprices, the declared figure is shown so
+a stale number is visible.
 
 ```sh
 decoyrail status        # tokens + $ per model for LLM hosts, MB for the rest
@@ -168,6 +190,11 @@ what keeps breaking it:
 - hit rate per model, and the dollars cache reads saved against full-price
   input (for subscription traffic: the API-equivalent value, which is plan
   headroom),
+- what repairable cache misses cost: when a repeating prefix keeps
+  re-billing for want of a cache marker, the report prices that waste (a
+  byte-derived estimate, marked `~`). On billed traffic it is wasted
+  dollars; on subscription traffic it is plan headroom spent on avoidable
+  misses, priced at API-equivalent rates,
 - whether requests carry cache markers at all,
 - prefix stability between consecutive requests: preserved, new
   conversation, diverged, or landed past the 5-minute TTL,
@@ -255,3 +282,55 @@ How it behaves:
 - **The budget lives in its own file** (`budget.json`), so the proxy's
   frequent usage writes can never clobber a budget you set while it was
   running. Both hot-reload into a running proxy.
+
+## The spend tripwire
+
+The monthly budget is a backstop, and it fires far too late for an agent that got stuck at 2am retrying the same failing request. The spend tripwire watches for runaway behavior in near real time and trips in minutes, not at the end of the month. It is a safety feature, so it ships in the free tier, on by default, and no license state affects it.
+
+Two purely mechanical signals, no guessing about intent:
+
+- **Repetition:** the same request (same destination, method, and body) seen `repeats` times inside the sliding window. Fifteen byte-identical LLM calls in five minutes is a loop, not a retry.
+- **Rate:** the window's metered spend far above the session's own earlier pace, past both a multiplier and an absolute dollar floor. A young session has no baseline yet and cannot rate-trip; the repeat detector and the kill switch still stand.
+
+It is configured in the policy's `[spend_tripwire]` table (hot-reloaded like the rest), shown here with its defaults:
+
+```toml
+[spend_tripwire]
+mode = "block"          # block | alert | off
+repeats = 15
+window_secs = 300
+rate_multiplier = 10.0  # 0 disables rate detection
+rate_floor_usd = 5.0
+```
+
+Only LLM-bound traffic (hosts the pricing table maps to a provider) is watched and, on a trip, blocked; `git push` and `cargo fetch` keep flowing. In `block` mode the tripping request and everything LLM-bound after it get a 403 whose JSON body names the trigger, the counts, and the clear command, so a coding agent can read why its requests stopped and break its own loop. In `alert` mode the trip is recorded once and traffic keeps forwarding: visibility before enforcement, same as the DLP detectors' warn posture.
+
+A trip is deliberately sticky. It persists to `trip.json`, survives a proxy restart, reaches every session sharing the state dir, and also stops Pro keep-alive pre-warms (quiet recurring spend is exactly what a tripped session must not keep accruing). Nothing clears it but an operator: `decoyrail trip` shows the trip and `decoyrail trip clear` clears it, resets detection state, and writes its own audit event. `decoyrail status` puts a standing trip on the front page, and `decoyrail log -t` renders the events with `[TRIP]` prominence, same as the honeytoken alarm: both are tripwires, one on secrets, one on cost.
+
+The audit events carry a salted fingerprint of the repeated request and the counts, never request content, exactly like DLP hits. If your agent legitimately polls one endpoint with identical bodies, raise `repeats` or widen `window_secs` for your traffic; the defaults are chosen so ordinary retry-with-backoff never gets close.
+
+## Budget soft-landing (Pro)
+
+The kill switch is binary: under budget everything flows, at 100% everything stops. Soft-landing adds a band in between. Past a threshold you set, requests that name a model in your downgrade map are rewritten to the cheaper model, so the agent keeps working at lower cost instead of hitting the wall at speed. At 100% the kill switch still stops everything, exactly as above.
+
+It switches on in the policy's `[soft_landing]` table (hot-reloaded, like the rest of the policy) and is off by default:
+
+```toml
+[soft_landing]
+threshold_pct = 80
+map = { "claude-opus-4" = "claude-sonnet-5", "gpt-5" = "gpt-5-mini" }
+```
+
+The map is yours. Decoyrail has no built-in opinion about which models are equivalent, and a model with no entry forwards untouched. Only the top-level `model` field of recognized LLM request bodies (the Anthropic and OpenAI JSON shapes) is rewritten, byte-surgically, so everything else in the request is exactly what the client sent. A request whose model can't be identified passes through unchanged; Decoyrail never guesses. A map that names a target model the pricing table doesn't know still forwards as configured (the provider errors informatively), and the audit note flags the likely typo.
+
+Downgrades never happen silently:
+
+- every rewritten request gets a `downgrade` audit event naming the mapping and the budget fraction that triggered it,
+- the response carries an `x-decoyrail-downgrade: <from> -> <to>` header,
+- `decoyrail status` says when the session is in the degraded band.
+
+One caveat, which the audit note also states: provider prompt caches are model-scoped, so a model rewrite invalidates the warm cache and the first downgraded request pays a cold cache write for the new model. The visibility exists so that cost stays attributable instead of mysterious.
+
+When a [route rule](policy.md#route-allow-on-a-cheaper-model-pro) also matches, soft-landing rewrites first and the route map applies to the result, each with its own audit event.
+
+The threshold reads the same billable spend as the kill switch, so subscription traffic never pushes a session into the band. This is a Pro feature: without a license, or with the table absent, behavior is exactly today's, nothing between a healthy budget and the hard kill switch.
