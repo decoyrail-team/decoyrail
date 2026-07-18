@@ -1079,7 +1079,7 @@ async fn proxy_end_to_end() {
     //     no secret is ever released by warn.
     let set_policy = |text: &str, bump: u64| {
         let path = home.path().join("policy.toml");
-        std::fs::write(&path, text).unwrap();
+        decoyrail::policy_edit::write_policy(text, "test").unwrap();
         let f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
